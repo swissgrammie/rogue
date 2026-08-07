@@ -1,3 +1,4 @@
+use rogue::entity;
 use rogue::map::{self, Dungeon};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,8 +40,10 @@ fn run(opts: Options) {
     let dungeon = Dungeon::generate_sized(seed, opts.width, opts.height);
 
     if opts.dump_map {
+        let spawn = entity::populate_seeded(&dungeon, seed);
         println!("seed: {seed}");
         print!("{}", dungeon.render());
+        println!("{}", spawn.summary());
         return;
     }
 
