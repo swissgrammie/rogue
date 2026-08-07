@@ -11,6 +11,49 @@ use crate::rng::Rng;
 pub const MAP_WIDTH: usize = 80;
 pub const MAP_HEIGHT: usize = 24;
 
+/// Floor for auto-fitting the map to the terminal ([`fit_bounds`]).
+///
+/// Any terminal at least [`MIN_FIT_WIDTH`] columns wide and
+/// `MIN_FIT_HEIGHT + 2` rows tall (the two reserved UI lines) gets a map
+/// that fits exactly; anything smaller still generates a playable level via
+/// the tiny-map fallback in [`Dungeon::generate_sized`] instead of
+/// panicking. The width floor is the 3x3 room grid's native minimum; the
+/// height floor (13) sits below the grid's 18-row minimum, so a short
+/// window like 40x15 degrades to a single-room level rather than
+/// overflowing.
+pub const MIN_FIT_WIDTH: usize = GRID_COLS * (MIN_ROOM_WIDTH + 2 * CELL_MARGIN);
+pub const MIN_FIT_HEIGHT: usize = 13;
+
+/// The map size that fits a `cols`x`rows` terminal: the full width, and the
+/// height minus the two reserved lines below the map (the status line and
+/// the hint/message line), both floored at [`MIN_FIT_WIDTH`] x
+/// [`MIN_FIT_HEIGHT`].
+pub fn fit_bounds(cols: usize, rows: usize) -> (usize, usize) {
+    resolve_map_size(None, None, cols, rows)
+}
+
+/// Resolve the map size for an interactive session.
+///
+/// `width`/`height` are explicit `--width`/`--height` overrides when given
+/// (`Some`) and terminal auto-fit otherwise (`None`): an auto width is the
+/// terminal's column count, an auto height is the row count minus the two
+/// reserved UI lines. Every result is floored at the [`MIN_FIT_WIDTH`] x
+/// [`MIN_FIT_HEIGHT`] minimums, so a degenerate `terminal::size()` result
+/// can never ask the generator for a useless sliver of a map.
+pub fn resolve_map_size(
+    width: Option<usize>,
+    height: Option<usize>,
+    cols: usize,
+    rows: usize,
+) -> (usize, usize) {
+    let w = width.unwrap_or(cols).max(MIN_FIT_WIDTH);
+    let h = match height {
+        Some(h) => h.max(MIN_FIT_HEIGHT),
+        None => rows.saturating_sub(2).max(MIN_FIT_HEIGHT),
+    };
+    (w, h)
+}
+
 /// The room grid: 3 columns by 3 rows of cells, at most one room per cell.
 pub const GRID_COLS: usize = 3;
 pub const GRID_ROWS: usize = 3;
@@ -103,10 +146,9 @@ impl Dungeon {
     pub fn generate_sized(seed: u64, width: usize, height: usize) -> Dungeon {
         let min_width = GRID_COLS * (MIN_ROOM_WIDTH + 2 * CELL_MARGIN);
         let min_height = GRID_ROWS * (MIN_ROOM_HEIGHT + 2 * CELL_MARGIN);
-        assert!(
-            width >= min_width && height >= min_height,
-            "map must be at least {min_width}x{min_height}"
-        );
+        if width < min_width || height < min_height {
+            return Dungeon::generate_tiny(seed, width, height);
+        }
 
         let mut rng = Rng::new(seed);
         let mut dungeon = Dungeon {
@@ -129,6 +171,34 @@ impl Dungeon {
             dungeon.carve_corridor(a, b, &mut rng);
         }
 
+        dungeon
+    }
+
+    /// Tiny-map fallback: a single room filling the whole interior, wall
+    /// ring around it. The 3x3 room grid needs `min_width`x`min_height`;
+    /// anything smaller (a short or narrow terminal window) still gets a
+    /// playable level instead of panicking. Room interiors never drop below
+    /// the generator's own minimum ([`MIN_ROOM_WIDTH`] x
+    /// [`MIN_ROOM_HEIGHT`]). The room is recorded in cell 0 so stair, Amulet,
+    /// and monster placement find it like any generated room.
+    fn generate_tiny(seed: u64, width: usize, height: usize) -> Dungeon {
+        let _ = seed; // layout is fully determined by the size
+        let w = width.max(MIN_ROOM_WIDTH + 2);
+        let h = height.max(MIN_ROOM_HEIGHT + 2);
+        let mut dungeon = Dungeon {
+            width: w,
+            height: h,
+            tiles: vec![Tile::Wall; w * h],
+            rooms: [None; GRID_CELLS],
+        };
+        let room = Room {
+            x0: 1,
+            y0: 1,
+            x1: w - 2,
+            y1: h - 2,
+        };
+        dungeon.rooms[0] = Some(room);
+        dungeon.carve_room(&room);
         dungeon
     }
 
@@ -547,5 +617,55 @@ mod tests {
         assert!(lines.iter().all(|l| l.chars().count() == MAP_WIDTH));
         assert!(lines.iter().all(|l| l.chars().all(|c| "#.+".contains(c))));
         assert!(d.render().contains('+'), "expected at least one door");
+    }
+
+    #[test]
+    fn fit_bounds_fills_the_terminal_minus_the_two_ui_lines() {
+        assert_eq!(fit_bounds(80, 24), (80, 22));
+        assert_eq!(fit_bounds(40, 15), (40, 13));
+        assert_eq!(fit_bounds(120, 40), (120, 38));
+    }
+
+    #[test]
+    fn fit_bounds_never_drops_below_the_minimums() {
+        assert_eq!(fit_bounds(10, 10), (MIN_FIT_WIDTH, MIN_FIT_HEIGHT));
+        assert_eq!(fit_bounds(0, 0), (MIN_FIT_WIDTH, MIN_FIT_HEIGHT));
+        // A 3-row terminal leaves 1 row after the two reserved lines.
+        assert_eq!(fit_bounds(10, 3), (MIN_FIT_WIDTH, MIN_FIT_HEIGHT));
+    }
+
+    #[test]
+    fn explicit_overrides_win_over_the_terminal() {
+        assert_eq!(resolve_map_size(Some(100), Some(30), 40, 15), (100, 30));
+        assert_eq!(resolve_map_size(Some(100), None, 40, 15), (100, 13));
+        assert_eq!(resolve_map_size(None, Some(30), 40, 15), (40, 30));
+        // ...and are still floored at the minimums.
+        assert_eq!(
+            resolve_map_size(Some(5), Some(5), 40, 15),
+            (MIN_FIT_WIDTH, MIN_FIT_HEIGHT)
+        );
+    }
+
+    #[test]
+    fn tiny_maps_generate_a_playable_single_room_without_panicking() {
+        // Below the native 3x3-grid minimum on width, height, or both.
+        for (w, h) in [(40, 13), (20, 20), (30, 10), (24, 17), (23, 18), (5, 3)] {
+            let d = Dungeon::generate_sized(7, w, h);
+            let rendered = d.render();
+            let lines: Vec<&str> = rendered.lines().collect();
+            assert_eq!(lines.len(), d.height, "{w}x{h}");
+            assert!(lines.iter().all(|l| l.chars().count() == d.width), "{w}x{h}");
+
+            let rooms = d.rooms();
+            assert_eq!(rooms.len(), 1, "{w}x{h}: expected a single room");
+            assert!(rooms[0].x0 >= 1 && rooms[0].y0 >= 1, "{w}x{h}");
+            assert!(rooms[0].x1 + 1 < d.width && rooms[0].y1 + 1 < d.height, "{w}x{h}");
+            assert!(rooms[0].width() >= MIN_ROOM_WIDTH, "{w}x{h}");
+            assert!(rooms[0].height() >= MIN_ROOM_HEIGHT, "{w}x{h}");
+            // The interior is all floor; the border is solid wall.
+            assert_eq!(d.tile(1, 1), Tile::Floor, "{w}x{h}");
+            assert_eq!(d.tile(0, 0), Tile::Wall, "{w}x{h}");
+            assert_eq!(d.tile(d.width - 1, d.height - 1), Tile::Wall, "{w}x{h}");
+        }
     }
 }
