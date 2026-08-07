@@ -3,6 +3,7 @@
 //! Modules stay small and single-purpose (see `AGENTS.md`); the binary in
 //! `main.rs` is a thin shell over them.
 
+pub mod combat;
 pub mod entity;
 pub mod game;
 pub mod map;
