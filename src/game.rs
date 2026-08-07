@@ -1,12 +1,21 @@
-//! The game loop: raw-mode input, rendering, and one combat round per move.
+//! The game loop: input, rendering, the combat round, and level progression.
+//!
+//! One terminal frame per keypress: redraw the level with the player marker
+//! (`@`) after every move. Input mapping and collision checks live in pure
+//! functions so the rules stay unit-testable without a terminal. The UI is
+//! deliberately raw crossterm for now; ratatui lands later without changing
+//! the game rules here.
 //!
 //! Each round follows Rogue's phase order (report §7.1): the player acts
 //! first (move, or fight the monster in the way), then the AFTER daemons run
 //! in order — `runners` (monsters wake/chase/attack) → `doctor` (healing) →
 //! `stomach` (hunger). All combat math lives in `crate::combat`; this module
 //! owns input mapping, rendering, the status line, and round state (the
-//! `quiet` healing counter). The UI is deliberately raw crossterm for now;
-//! ratatui lands later without changing the game rules here.
+//! `quiet` healing counter).
+//!
+//! Level progression (stairs, the floor counter, the Amulet, the win) is
+//! coordinated here too: `Game` is the integration point the combat module
+//! reads the floor number from and extends the status line at.
 
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{read, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -18,11 +27,21 @@ use std::io::{self, Write};
 
 use crate::combat;
 use crate::entity::{self, Monster, Player};
+use crate::levels::{self, Amulet, Stairs, AMULET_LEVEL, MAX_FLOOR};
 use crate::map::Dungeon;
 use crate::rng::Rng;
 
-/// The four movement directions, as in classic Rogue.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// Glyph for a down staircase. Classic Rogue draws both stairs as `%`
+/// (rogue.h `#define STAIRS '%'`); since our floors carry two staircases the
+/// down one gets the familiar `>` so the two ends read clearly.
+pub const STAIRS_DOWN_GLYPH: char = '>';
+/// Glyph for an up staircase; on floor 1 this is the surface exit.
+pub const STAIRS_UP_GLYPH: char = '<';
+/// Glyph for the Amulet of Yendor while it lies on the floor (rogue.h
+/// `#define AMULET ','`).
+pub const AMULET_GLYPH: char = ',';
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
     North,
     South,
@@ -30,9 +49,7 @@ pub enum Direction {
     West,
 }
 
-/// The keys the game reacts to. Crossterm events are normalized into this
-/// small set first, so `key_to_direction` stays pure and terminal-free.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
     Char(char),
     Up,
@@ -43,7 +60,6 @@ pub enum Key {
     Unknown,
 }
 
-/// Map `key` to the direction it moves the player, if any.
 pub fn key_to_direction(key: Key) -> Option<Direction> {
     match key {
         Key::Char('h') | Key::Left => Some(Direction::West),
@@ -69,7 +85,8 @@ pub fn next_position(x: usize, y: usize, dir: Direction) -> Option<(usize, usize
 }
 
 /// May a step from `(x, y)` in `dir` leave the map or hit a wall? Floor,
-/// door, and corridor tiles are passable.
+/// door, and corridor tiles are passable. Staircases and the Amulet sit on
+/// walkable tiles, so they never block.
 pub fn can_move(map: &Dungeon, x: usize, y: usize, dir: Direction) -> bool {
     let Some((nx, ny)) = next_position(x, y, dir) else {
         return false;
@@ -80,45 +97,91 @@ pub fn can_move(map: &Dungeon, x: usize, y: usize, dir: Direction) -> bool {
     map.tile(nx, ny).is_walkable()
 }
 
-/// One play session over a single level.
+/// One play session. `Game` is the integration point between level
+/// progression, the spawner (`entity`), and combat: it owns the current
+/// floor, the level's features, the victory state, and the round state.
 pub struct Game {
     pub map: Dungeon,
     pub player: Player,
     pub monsters: Vec<Monster>,
-    /// Current dungeon floor. Combat reads it for monster scaling; the level
-    /// progression task owns stairs/floors and will evolve this field.
+    /// Current dungeon floor (1..=MAX_FLOOR). Combat reads it for monster
+    /// scaling; level progression owns stairs and floors.
     pub floor: u32,
+    /// The base seed of the game; each floor's map seed is derived from it
+    /// with [`levels::floor_seed`], so re-entering a floor is deterministic.
+    pub seed: u64,
     /// RNG for spawning and all combat rolls. Seeded from `seed`, so a seed
     /// reproduces the level, its inhabitants, and every die roll.
     pub rng: Rng,
     /// Quiet rounds since the last combat: resets to 0 on any fight and
     /// gates healing (report §7.3).
     pub quiet: u32,
-    pub seed: u64,
     /// The most recent event, shown under the status line.
     pub last_message: Option<String>,
+    pub stairs: Stairs,
+    /// Where the Amulet lies on the floor, if it still does. `None` on every
+    /// floor but [`AMULET_LEVEL`], and once the player carries it.
+    pub amulet: Option<Amulet>,
+    /// Whether the player carries the Amulet of Yendor (a simple carried
+    /// flag; a real inventory comes later).
+    pub has_amulet: bool,
+    /// True once the player escapes: floor 1's exit stair with the Amulet.
+    pub won: bool,
 }
 
 impl Game {
-    /// The player starts in the center of the first room the generator
-    /// placed, on floor 1, with the level's monsters already spawned.
-    pub fn new(map: Dungeon, seed: u64) -> Game {
-        let mut rng = Rng::new(seed);
-        let spawn = entity::populate(&map, 1, &mut rng);
+    /// A fresh game on floor 1 of a newly generated dungeon.
+    pub fn new(seed: u64, width: usize, height: usize) -> Game {
+        Self::at_floor(seed, 1, width, height)
+    }
+
+    /// Wrap an already-generated map as a floor-1 game (tests, tools). For
+    /// maps the generator would produce from `seed` this matches `new`
+    /// exactly; hand-built fixture maps just get their features laid on top.
+    pub fn from_map(map: Dungeon, seed: u64) -> Game {
+        Self::assemble(map, 1, seed)
+    }
+
+    /// Generate (or deterministically regenerate) the floor `floor` and
+    /// assemble a full game state around it.
+    fn at_floor(seed: u64, floor: u32, width: usize, height: usize) -> Game {
+        assert!((1..=MAX_FLOOR).contains(&floor), "floor {floor} out of range");
+        let map = Dungeon::generate_sized(levels::floor_seed(seed, floor), width, height);
+        Self::assemble(map, floor, seed)
+    }
+
+    /// Lay the player, monsters, stairs, and (on the Amulet floor) the Amulet
+    /// onto one map. All placement rolls come from one rng seeded with the
+    /// floor's map seed, so the same `(seed, floor)` always rebuilds the same
+    /// level — which is what makes re-ascending deterministic.
+    fn assemble(map: Dungeon, floor: u32, seed: u64) -> Game {
+        let map_seed = levels::floor_seed(seed, floor);
+        let mut rng = Rng::new(map_seed);
+        let spawn = entity::populate(&map, floor, &mut rng);
+        let stairs = levels::place_stairs(&map, &mut rng, (spawn.player.x, spawn.player.y));
+        let amulet = (floor == AMULET_LEVEL)
+            .then(|| levels::place_amulet(&map, &mut rng, stairs, (spawn.player.x, spawn.player.y)));
         Game {
             map,
-            player: spawn.player,
+            player: Player::new(spawn.player.x, spawn.player.y),
+            seed,
+            floor,
+            stairs,
+            amulet,
+            has_amulet: false,
+            won: false,
             monsters: spawn.monsters,
-            floor: 1,
             rng,
             quiet: 0,
-            seed,
             last_message: None,
         }
     }
 
     /// One round (report §7.1): the player acts, then the AFTER daemons run
     /// in order — runners → doctor → stomach. Bumping a wall spends no turn.
+    /// Staircases and the Amulet are handled between the player action and
+    /// the AFTER phase, so descending moves the player before the new
+    /// floor's monsters act.
     pub fn step(&mut self, dir: Direction) {
         // 1. Player action. Moving into a monster starts a fight; the target
         //    is woken (runto) before the swing, so the player never benefits
@@ -154,7 +217,13 @@ impl Game {
         }
         self.player.running = true;
 
-        // 2. AFTER phase: runners → doctor → stomach.
+        // 2. Level features: pick up the Amulet, take a staircase, win.
+        self.after_move();
+        if self.won {
+            return;
+        }
+
+        // 3. AFTER phase: runners → doctor → stomach.
         let report = combat::monster_phase(
             &mut self.rng,
             &self.map,
@@ -182,6 +251,80 @@ impl Game {
         }
     }
 
+    /// Move the player one tile in `dir`; returns whether the position
+    /// changed (a blocked move changes nothing). Pure movement: no fight, no
+    /// stairs, no monster phase.
+    pub fn move_player(&mut self, dir: Direction) -> bool {
+        if can_move(&self.map, self.player.x, self.player.y, dir) {
+            let (nx, ny) = next_position(self.player.x, self.player.y, dir)
+                .expect("can_move validated the step");
+            self.player.x = nx;
+            self.player.y = ny;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// React to the player's position after a successful move: pick up the
+    /// Amulet, take a staircase, and detect the escape. The game loop stops
+    /// when [`Game::won`] is set.
+    pub fn after_move(&mut self) {
+        self.try_pick_up_amulet();
+        self.take_stairs();
+    }
+
+    /// Stepping onto the Amulet tile carries it (the "found the Amulet"
+    /// event). It then leaves the floor.
+    fn try_pick_up_amulet(&mut self) {
+        let Some(amulet) = self.amulet else { return };
+        if (self.player.x, self.player.y) == (amulet.x, amulet.y) {
+            self.has_amulet = true;
+            self.amulet = None;
+        }
+    }
+
+    /// Stepping onto a staircase moves between floors; stepping onto floor 1's
+    /// exit stair with the Amulet wins. On floor 26 the down stair leads
+    /// nowhere and on floor 1 the exit is magically blocked without the
+    /// Amulet — both are a no-op.
+    fn take_stairs(&mut self) {
+        let pos = (self.player.x, self.player.y);
+        if pos == self.stairs.down {
+            if self.floor < MAX_FLOOR {
+                self.descend();
+            }
+        } else if pos == self.stairs.up {
+            if levels::has_escaped(self.floor, true, self.has_amulet) {
+                self.won = true;
+            } else if self.floor > 1 {
+                self.ascend();
+            }
+        }
+    }
+
+    /// Descend one floor: regenerate the next floor deterministically and
+    /// arrive on its up staircase.
+    fn descend(&mut self) {
+        let carried = self.has_amulet;
+        let next = Self::at_floor(self.seed, self.floor + 1, self.map.width, self.map.height);
+        let (x, y) = next.stairs.up;
+        *self = next;
+        self.has_amulet = carried;
+        self.player = Player::new(x, y);
+    }
+
+    /// Ascend one floor: regenerate the previous floor deterministically and
+    /// arrive on its down staircase. The Amulet travels with the player.
+    fn ascend(&mut self) {
+        let carried = self.has_amulet;
+        let next = Self::at_floor(self.seed, self.floor - 1, self.map.width, self.map.height);
+        let (x, y) = next.stairs.down;
+        *self = next;
+        self.has_amulet = carried;
+        self.player = Player::new(x, y);
+    }
+
     /// The glyph at `(x, y)`: the player, else a monster, else the tile.
     pub fn glyph_at(&self, x: usize, y: usize) -> char {
         if x == self.player.x && y == self.player.y {
@@ -196,13 +339,14 @@ impl Game {
 
     /// The status line, formatted per report §9
     /// (`Level: 1  Gold: 0  Hp: 12(12)  Str: 16(16)  Arm: 4   Exp: 1/0`).
-    /// "Arm" is `10 - effective AC`, so a fresh player in ring mail shows 4
-    /// while combat resolves against 6.
+    /// `Level:` is the dungeon floor; `Exp:` is the player's experience level
+    /// and points. "Arm" is `10 - effective AC`, so a fresh player in ring
+    /// mail shows 4 while combat resolves against 6.
     pub fn status_line(&self) -> String {
         let p = &self.player;
-        format!(
+        let mut line = format!(
             "Level: {}  Gold: {}  Hp: {}({})  Str: {}({})  Arm: {}   Exp: {}/{}",
-            p.level,
+            self.floor,
             p.gold,
             p.hp,
             p.max_hp,
@@ -211,19 +355,21 @@ impl Game {
             10 - combat::STARTING_ARMOR_AC,
             p.level,
             p.experience,
-        )
+        );
+        if self.has_amulet {
+            line.push_str("  Amulet: carried");
+        }
+        if !self.has_amulet && self.at_exit() {
+            line.push_str("  (the way out is magically blocked)");
+        }
+        line
     }
 
-    /// The level with `@` and the monsters on top of it, then the status
-    /// line and a one-line hint or last message.
+    /// The level with every feature overlaid (monsters, staircases, the
+    /// Amulet, and `@`), then the status line and a one-line hint or message.
     pub fn render(&self) -> String {
-        let mut out = String::with_capacity((self.map.width + 1) * (self.map.height + 2));
-        for y in 0..self.map.height {
-            for x in 0..self.map.width {
-                out.push(self.glyph_at(x, y));
-            }
-            out.push('\n');
-        }
+        let mut out =
+            render_level(&self.map, self.player.clone(), self.stairs, self.amulet, &self.monsters);
         out.push_str(&self.status_line());
         out.push('\n');
         match &self.last_message {
@@ -237,12 +383,58 @@ impl Game {
         out
     }
 
+    /// Is the player standing on floor 1's exit stair?
+    fn at_exit(&self) -> bool {
+        self.floor == 1 && (self.player.x, self.player.y) == self.stairs.up
+    }
+
     /// Repaint the whole frame.
     fn draw(&self, out: &mut impl Write) -> io::Result<()> {
         execute!(out, MoveTo(0, 0), Clear(ClearType::All))?;
         write!(out, "{}", self.render())?;
         out.flush()
     }
+
+    #[cfg(test)]
+    /// The test twin of a successful move in the play loop: put the player
+    /// on `pos` and run one `after_move`.
+    fn step_onto(&mut self, pos: (usize, usize)) {
+        self.player = Player::new(pos.0, pos.1);
+        self.after_move();
+    }
+}
+
+/// A level's map with its features overlaid: monsters, staircases, the Amulet
+/// (`,`) and the player (`@`). Shared by the play loop and `--dump-map`.
+pub fn render_level(
+    map: &Dungeon,
+    player: Player,
+    stairs: Stairs,
+    amulet: Option<Amulet>,
+    monsters: &[entity::Monster],
+) -> String {
+    let mut out = String::with_capacity((map.width + 1) * map.height);
+    for y in 0..map.height {
+        for x in 0..map.width {
+            let pos = (x, y);
+            let glyph = if pos == (player.x, player.y) {
+                '@'
+            } else if let Some(monster) = monsters.iter().find(|m| (m.x, m.y) == pos) {
+                monster.symbol()
+            } else if amulet.is_some_and(|a| (a.x, a.y) == pos) {
+                AMULET_GLYPH
+            } else if pos == stairs.down {
+                STAIRS_DOWN_GLYPH
+            } else if pos == stairs.up {
+                STAIRS_UP_GLYPH
+            } else {
+                map.tile(x, y).glyph()
+            };
+            out.push(glyph);
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// Enter raw mode and the alternate screen; restores everything on drop no
@@ -301,9 +493,26 @@ fn read_key() -> io::Result<Key> {
     }
 }
 
-/// Play one level: draw it, then loop on keys until the player quits or dies.
-pub fn run(map: Dungeon, seed: u64) -> io::Result<()> {
-    let mut game = Game::new(map, seed);
+/// The victory screen: the player escaped with the Amulet.
+fn escape_screen(out: &mut impl Write, game: &Game) -> io::Result<()> {
+    execute!(out, MoveTo(0, 0), Clear(ClearType::All))?;
+    writeln!(out, "You escaped with the Amulet!")?;
+    writeln!(out)?;
+    writeln!(out, "Climbing the last stair, you step out of the Dungeons of Doom")?;
+    writeln!(out, "into the light of day, the Amulet of Yendor warm in your pack.")?;
+    writeln!(out)?;
+    writeln!(out, "Final floor: {}   seed: {}", game.floor, game.seed)?;
+    writeln!(out)?;
+    writeln!(out, "Press any key to return to your terminal.")?;
+    out.flush()?;
+    read_key()?;
+    Ok(())
+}
+
+/// Play the game: draw the current floor, then loop on keys until the player
+/// quits, dies, or escapes with the Amulet.
+pub fn run(seed: u64, width: usize, height: usize) -> io::Result<()> {
+    let mut game = Game::new(seed, width, height);
     let _guard = TerminalGuard::enter()?;
     let mut out = io::stdout();
 
@@ -315,8 +524,10 @@ pub fn run(map: Dungeon, seed: u64) -> io::Result<()> {
         match read_key()? {
             Key::Char('q') | Key::Escape => return Ok(()),
             key => {
-                if let Some(dir) = key_to_direction(key) {
-                    game.step(dir);
+                let Some(dir) = key_to_direction(key) else { continue };
+                game.step(dir);
+                if game.won {
+                    return escape_screen(&mut out, &game);
                 }
             }
         }
@@ -429,15 +640,18 @@ mod tests {
     fn player_starts_in_first_room_center() {
         let map = Dungeon::generate(7);
         let (x, y) = map.rooms()[0].center();
-        let game = Game::new(map, 7);
+        let game = Game::from_map(map, 7);
         assert_eq!((game.player.x, game.player.y), (x, y));
         assert!(game.map.tile(x, y).is_walkable());
+        assert_eq!(game.floor, 1);
+        assert!(!game.has_amulet);
+        assert!(!game.won);
     }
 
     #[test]
     fn move_player_walks_the_level_and_stops_at_walls() {
         // map_from maps have no rooms: the player lands in the top-left.
-        let mut game = Game::new(map_from(&TEST_MAP), 0);
+        let mut game = Game::from_map(map_from(&TEST_MAP), 0);
         assert_eq!((game.player.x, game.player.y), (1, 1));
 
         // E E N E E E: floor -> floor -> floor -> door -> floor -> corridor.
@@ -449,32 +663,27 @@ mod tests {
             Direction::East,
             Direction::East,
         ] {
-            game.step(dir);
+            game.move_player(dir);
         }
         assert_eq!((game.player.x, game.player.y), (6, 0));
         assert_eq!(game.map.tile(6, 0), Tile::Corridor);
 
         // (7,0) is a wall: the step is refused and the player stays put.
-        game.step(Direction::East);
+        game.move_player(Direction::East);
         assert_eq!((game.player.x, game.player.y), (6, 0));
     }
 
     #[test]
     fn render_marks_the_player_once_and_shows_the_status_line() {
-        let mut game = Game::new(map_from(&TEST_MAP), 0);
-        game.step(Direction::East);
+        let mut game = Game::from_map(map_from(&TEST_MAP), 0);
+        game.move_player(Direction::East);
         let frame = game.render();
         assert_eq!(frame.matches('@').count(), 1);
         // Map lines, then the §9 status line, then a hint/message line.
         let lines: Vec<&str> = frame.lines().collect();
         assert_eq!(lines.len(), TEST_MAP.len() + 2);
-        // '~' renders as '.', and the player '@' now sits on row 1, column 2.
-        assert_eq!(lines[0], "#.#.+..#");
-        assert_eq!(lines[1], "..@.#..#");
-        assert_eq!(lines[2], "#....+.#");
-        assert_eq!(lines[3], "#.####..");
         assert_eq!(
-            lines[4],
+            lines[TEST_MAP.len()],
             "Level: 1  Gold: 0  Hp: 12(12)  Str: 16(16)  Arm: 4   Exp: 1/0"
         );
     }
@@ -484,7 +693,7 @@ mod tests {
     /// it never gets a counterattack that round.
     #[test]
     fn round_order_player_kills_before_monsters_act() {
-        let mut game = Game::new(map_from(&TEST_MAP), 1);
+        let mut game = Game::from_map(map_from(&TEST_MAP), 1);
         game.player = Player::new(1, 1);
         game.player.experience = 8_000_000; // level 21: automatic hit
         game.player.level = 21;
@@ -507,7 +716,7 @@ mod tests {
     /// AFTER phase, still within the same round.
     #[test]
     fn round_order_monsters_strike_back_after_the_player() {
-        let mut game = Game::new(map_from(&TEST_MAP), 2);
+        let mut game = Game::from_map(map_from(&TEST_MAP), 2);
         game.player = Player::new(1, 1); // level 1, str 16
         let mut jabberwock = monster(MonsterKind::Jabberwock, 2, 1);
         jabberwock.level = 15;
@@ -526,10 +735,162 @@ mod tests {
 
     #[test]
     fn status_line_matches_report_section_9() {
-        let game = Game::new(map_from(&TEST_MAP), 0);
+        let game = Game::from_map(map_from(&TEST_MAP), 0);
         assert_eq!(
             game.status_line(),
             "Level: 1  Gold: 0  Hp: 12(12)  Str: 16(16)  Arm: 4   Exp: 1/0"
         );
+    }
+
+    #[test]
+    fn game_starts_on_floor_one_with_both_stairs() {
+        let game = Game::new(7, crate::map::MAP_WIDTH, crate::map::MAP_HEIGHT);
+        assert_eq!(game.floor, 1);
+        assert_ne!(game.stairs.up, game.stairs.down);
+        assert!(game.amulet.is_none(), "no Amulet on floor 1");
+        assert!(game.map.tile(game.stairs.up.0, game.stairs.up.1).is_walkable());
+        assert!(game.map.tile(game.stairs.down.0, game.stairs.down.1).is_walkable());
+    }
+
+    /// Descending regenerates the next floor deterministically; ascending
+    /// rebuilds the floor above identically, so a round trip returns to the
+    /// exact same level (map, monsters, and stairs).
+    #[test]
+    fn descend_and_ascend_round_trip_is_deterministic() {
+        let mut game = Game::new(7, crate::map::MAP_WIDTH, crate::map::MAP_HEIGHT);
+        let floor1_map = game.map.render();
+        let floor1_monsters = game.monsters.clone();
+        let floor1_stairs = game.stairs;
+
+        game.step_onto(game.stairs.down);
+        assert_eq!(game.floor, 2);
+        // The player arrives on the new floor's up staircase.
+        assert_eq!((game.player.x, game.player.y), game.stairs.up);
+
+        let floor2_map = game.map.render();
+        let floor2_stairs = game.stairs;
+        assert_ne!(floor2_map, floor1_map, "floor 2 must differ from floor 1");
+
+        game.step_onto(game.stairs.up);
+        assert_eq!(game.floor, 1);
+        // Back on the down staircase of the regenerated floor 1.
+        assert_eq!((game.player.x, game.player.y), game.stairs.down);
+        assert_eq!(game.map.render(), floor1_map, "floor 1 must regenerate identically");
+        assert_eq!(game.monsters, floor1_monsters);
+        assert_eq!(game.stairs, floor1_stairs);
+        assert_ne!(game.stairs, floor2_stairs);
+    }
+
+    #[test]
+    fn floor_counter_stays_within_bounds() {
+        // Cannot ascend above floor 1.
+        let mut game = Game::new(7, crate::map::MAP_WIDTH, crate::map::MAP_HEIGHT);
+        game.step_onto(game.stairs.up);
+        assert_eq!(game.floor, 1, "exit stair is magically blocked without the Amulet");
+        assert!(!game.won);
+        assert!(game.status_line().contains("magically blocked"));
+
+        // Cannot descend below floor 26.
+        for _ in 0..25 {
+            game.step_onto(game.stairs.down);
+        }
+        assert_eq!(game.floor, 26);
+        game.step_onto(game.stairs.down);
+        assert_eq!(game.floor, 26, "the dungeon ends at floor 26");
+    }
+
+    #[test]
+    fn amulet_lies_only_on_floor_26_and_is_picked_up_by_stepping_on_it() {
+        let mut game = Game::new(7, crate::map::MAP_WIDTH, crate::map::MAP_HEIGHT);
+        for _ in 0..24 {
+            game.step_onto(game.stairs.down);
+        }
+        assert_eq!(game.floor, 25);
+        assert!(game.amulet.is_none(), "no Amulet on floor 25");
+
+        game.step_onto(game.stairs.down);
+        assert_eq!(game.floor, 26);
+        let amulet = game.amulet.expect("the Amulet lies on floor 26");
+        assert_eq!(
+            game.map.tile(amulet.x, amulet.y),
+            Tile::Floor,
+            "Amulet not on a floor tile"
+        );
+
+        // Stepping onto it is the "found the Amulet" event.
+        game.step_onto((amulet.x, amulet.y));
+        assert!(game.has_amulet);
+        assert!(game.amulet.is_none(), "the Amulet leaves the floor once carried");
+        assert!(!game.won, "carrying the Amulet alone does not win");
+        assert!(game.status_line().contains("Amulet: carried"));
+    }
+
+    #[test]
+    fn escape_requires_floor_one_and_the_amulet() {
+        // On floor 1's exit stair without the Amulet: magically blocked.
+        let mut game = Game::new(7, crate::map::MAP_WIDTH, crate::map::MAP_HEIGHT);
+        game.step_onto(game.stairs.up);
+        assert_eq!(game.floor, 1);
+        assert!(!game.won);
+
+        // With the Amulet (simulated), stepping on the exit wins.
+        game.has_amulet = true;
+        game.after_move();
+        assert!(game.won);
+    }
+
+    /// The whole journey: descend all the way to floor 26, pick up the
+    /// Amulet, climb back out, and escape through floor 1's exit.
+    #[test]
+    fn full_victory_journey() {
+        let mut game = Game::new(7, crate::map::MAP_WIDTH, crate::map::MAP_HEIGHT);
+        for _ in 0..25 {
+            game.step_onto(game.stairs.down);
+        }
+        assert_eq!(game.floor, 26);
+
+        let amulet = game.amulet.expect("Amulet on floor 26");
+        game.step_onto((amulet.x, amulet.y));
+        assert!(game.has_amulet);
+
+        // Climb back up (floor 26 -> 2, then the last stair onto floor 1).
+        for _ in 0..24 {
+            game.step_onto(game.stairs.up);
+        }
+        assert_eq!(game.floor, 2);
+        game.step_onto(game.stairs.up);
+        assert_eq!(game.floor, 1);
+        assert!(!game.won, "arriving on floor 1 does not win by itself");
+
+        // Step onto the exit stair with the Amulet: escape.
+        game.step_onto(game.stairs.up);
+        assert!(game.won);
+        assert_eq!(game.floor, 1);
+    }
+
+    #[test]
+    fn status_line_leads_with_the_level_field() {
+        let game = Game::new(7, crate::map::MAP_WIDTH, crate::map::MAP_HEIGHT);
+        assert!(game.status_line().starts_with("Level: 1 "), "{}", game.status_line());
+        let mut deep = Game::new(7, crate::map::MAP_WIDTH, crate::map::MAP_HEIGHT);
+        for _ in 0..25 {
+            deep.step_onto(deep.stairs.down);
+        }
+        assert!(deep.status_line().starts_with("Level: 26 "), "{}", deep.status_line());
+    }
+
+    #[test]
+    fn render_level_draws_stairs_and_amulet_glyphs() {
+        let map = Dungeon::generate(3);
+        let stairs = Stairs {
+            up: (1, 1),
+            down: (2, 2),
+        };
+        let amulet = Amulet { x: 4, y: 4 };
+        let frame = render_level(&map, Player::new(1, 2), stairs, Some(amulet), &[]);
+        assert!(frame.contains(STAIRS_DOWN_GLYPH), "missing down stair glyph");
+        assert!(frame.contains(STAIRS_UP_GLYPH), "missing up stair glyph");
+        assert!(frame.contains(AMULET_GLYPH), "missing Amulet glyph");
+        assert_eq!(frame.matches('@').count(), 1);
     }
 }

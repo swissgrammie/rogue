@@ -499,10 +499,15 @@ impl fmt::Display for Monster {
 }
 
 /// Everything placed on one generated level.
+///
+/// `floor` records which dungeon floor this spawn belongs to. The combat
+/// module reads it (via this struct and the `populate` parameter) to scale
+/// monsters with depth; placement itself is floor-independent for now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Spawn {
     pub player: Player,
     pub monsters: Vec<Monster>,
+    pub floor: u32,
 }
 
 impl Spawn {
@@ -527,21 +532,25 @@ impl Spawn {
     }
 }
 
-/// Place the player and monsters on a generated level.
+/// Place the player and monsters on one floor of the dungeon.
 ///
 /// The player starts at the center of the first room. Each room has a
 /// three-in-four chance of holding one monster (roughly mirroring Rogue's
 /// per-room scatter); monsters land on room floor tiles only — never on the
 /// player's tile and never on each other. All rolls come from `rng`, so the
-/// same seed yields the same level *and* the same spawn (including rolled
-/// hit points). Hand-built maps without recorded rooms get the player in the
-/// top-left corner and no monsters.
+/// same seed yields the same level *and* the same spawn.
+///
+/// `floor` (1..=26) is the depth seam for the combat module: monster depth
+/// scaling (Rogue 5.4.4 `monsters.c` `new_monster`, `AMULETLEVEL = 26`) is
+/// consumed there, so the spawner just records which floor it populated.
+/// Roomless fixture maps (unit tests) fall back to a bare player at (1, 1).
 pub fn populate(dungeon: &Dungeon, floor: u32, rng: &mut Rng) -> Spawn {
     let rooms = dungeon.rooms();
-    let Some(room) = rooms.first() else {
+    let Some(room) = rooms.first().copied() else {
         return Spawn {
             player: Player::new(1, 1),
             monsters: Vec::new(),
+            floor,
         };
     };
     let player = Player::new(room.center().0, room.center().1);
@@ -564,7 +573,11 @@ pub fn populate(dungeon: &Dungeon, floor: u32, rng: &mut Rng) -> Spawn {
         blocked.insert((x, y));
         monsters.push(Monster::spawn(MonsterKind::random(rng), x, y, floor, rng));
     }
-    Spawn { player, monsters }
+    Spawn {
+        player,
+        monsters,
+        floor,
+    }
 }
 
 /// `populate` with a fresh RNG from `seed`, so a seed reproduces the whole
@@ -688,6 +701,17 @@ mod tests {
 
     /// In-bounds, on room floor tiles, never the player's tile, never each
     /// other's, for every seed.
+    #[test]
+    fn spawn_records_its_floor() {
+        for floor in [1u32, 13, 26] {
+            let dungeon = Dungeon::generate(floor as u64);
+            let spawn = populate_seeded(&dungeon, floor, floor as u64);
+            assert_eq!(spawn.floor, floor, "spawn must record floor {floor}");
+        }
+        let dungeon = Dungeon::generate(1);
+        assert_eq!(populate_seeded(&dungeon, 26, 1).floor, 26);
+    }
+
     #[test]
     fn spawn_is_valid_across_seeds() {
         for seed in SEEDS {
