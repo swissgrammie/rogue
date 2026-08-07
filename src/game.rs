@@ -21,14 +21,15 @@ use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{read, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, size, Clear, ClearType, EnterAlternateScreen,
+    LeaveAlternateScreen,
 };
 use std::io::{self, Write};
 
 use crate::combat;
 use crate::entity::{self, Monster, Player};
 use crate::levels::{self, Amulet, Stairs, AMULET_LEVEL, MAX_FLOOR};
-use crate::map::Dungeon;
+use crate::map::{self, Dungeon};
 use crate::rng::Rng;
 
 /// Glyph for a down staircase. Classic Rogue draws both stairs as `%`
@@ -325,6 +326,31 @@ impl Game {
         self.player = Player::new(x, y);
     }
 
+    /// Regenerate the current floor at a new map size (a terminal resize),
+    /// keeping the player's stats, position (when it still lands on walkable
+    /// floor), and carried Amulet. The level, monsters, and stairs re-roll
+    /// deterministically for the new size from the same floor seed.
+    fn resize(&mut self, width: usize, height: usize) {
+        let carried = self.has_amulet;
+        let (x, y) = (self.player.x, self.player.y);
+        let mut player = self.player.clone();
+        let mut next = Self::at_floor(self.seed, self.floor, width, height);
+        if x < width && y < height && next.map.tile(x, y).is_walkable() {
+            player.x = x;
+            player.y = y;
+        } else {
+            player.x = next.player.x;
+            player.y = next.player.y;
+        }
+        next.player = player;
+        next.monsters.retain(|m| (m.x, m.y) != (next.player.x, next.player.y));
+        if carried {
+            next.amulet = None;
+        }
+        next.has_amulet = carried;
+        *self = next;
+    }
+
     /// The glyph at `(x, y)`: the player, else a monster, else the tile.
     pub fn glyph_at(&self, x: usize, y: usize) -> char {
         if x == self.player.x && y == self.player.y {
@@ -367,20 +393,28 @@ impl Game {
 
     /// The level with every feature overlaid (monsters, staircases, the
     /// Amulet, and `@`), then the status line and a one-line hint or message.
+    /// The two UI lines are truncated to the map width so a narrow terminal
+    /// never wraps them.
     pub fn render(&self) -> String {
         let mut out =
             render_level(&self.map, self.player.clone(), self.stairs, self.amulet, &self.monsters);
-        out.push_str(&self.status_line());
+        out.push_str(&Self::fit_line(&self.status_line(), self.map.width));
         out.push('\n');
         match &self.last_message {
-            Some(message) => out.push_str(message),
-            None => out.push_str(&format!(
-                "seed {} — h/j/k/l or arrows move, q quits",
-                self.seed
+            Some(message) => out.push_str(&Self::fit_line(message, self.map.width)),
+            None => out.push_str(&Self::fit_line(
+                &format!("seed {} — h/j/k/l or arrows move, q quits", self.seed),
+                self.map.width,
             )),
         }
         out.push('\n');
         out
+    }
+
+    /// Truncate one UI line to `width` characters, so a narrow terminal never
+    /// wraps the status or hint lines.
+    fn fit_line(line: &str, width: usize) -> String {
+        line.chars().take(width).collect()
     }
 
     /// Is the player standing on floor 1's exit stair?
@@ -482,9 +516,28 @@ fn key_from_event(event: KeyEvent) -> Key {
     }
 }
 
-/// Block for one keypress. Resize and mouse events just wait for the next
-/// key; the following frame redraws the whole screen anyway.
-fn read_key() -> io::Result<Key> {
+/// One event the play loop reacts to: a keypress or a terminal resize.
+enum LoopEvent {
+    Key(Key),
+    Resize(u16, u16),
+}
+
+/// Block for one event: a keypress, or a resize so the frame can be
+/// regenerated at the new size. Mouse events just wait for the next event;
+/// the following frame redraws the whole screen anyway.
+fn read_event() -> io::Result<LoopEvent> {
+    loop {
+        match read()? {
+            Event::Key(event) => return Ok(LoopEvent::Key(key_from_event(event))),
+            Event::Resize(cols, rows) => return Ok(LoopEvent::Resize(cols, rows)),
+            _ => continue,
+        }
+    }
+}
+
+/// Block for any keypress; used by the victory screen, which has no layout
+/// to resize.
+fn any_key() -> io::Result<Key> {
     loop {
         match read()? {
             Event::Key(event) => return Ok(key_from_event(event)),
@@ -505,14 +558,19 @@ fn escape_screen(out: &mut impl Write, game: &Game) -> io::Result<()> {
     writeln!(out)?;
     writeln!(out, "Press any key to return to your terminal.")?;
     out.flush()?;
-    read_key()?;
+    any_key()?;
     Ok(())
 }
 
-/// Play the game: draw the current floor, then loop on keys until the player
-/// quits, dies, or escapes with the Amulet.
-pub fn run(seed: u64, width: usize, height: usize) -> io::Result<()> {
-    let mut game = Game::new(seed, width, height);
+/// Play the game: size the map to the terminal (or the explicit
+/// `--width`/`--height` overrides), draw the current floor, then loop on
+/// keys until the player quits, dies, or escapes with the Amulet. Terminal
+/// resizes regenerate the floor at the new size and redraw immediately.
+pub fn run(seed: u64, width: Option<usize>, height: Option<usize>) -> io::Result<()> {
+    // Fall back to the classic extent when there is no terminal to query.
+    let (cols, rows) = size().unwrap_or((map::MAP_WIDTH as u16, map::MAP_HEIGHT as u16));
+    let (w, h) = map::resolve_map_size(width, height, cols as usize, rows as usize);
+    let mut game = Game::new(seed, w, h);
     let _guard = TerminalGuard::enter()?;
     let mut out = io::stdout();
 
@@ -521,9 +579,15 @@ pub fn run(seed: u64, width: usize, height: usize) -> io::Result<()> {
         if game.player.hp <= 0 {
             return Ok(()); // the frame above shows "you have died"
         }
-        match read_key()? {
-            Key::Char('q') | Key::Escape => return Ok(()),
-            key => {
+        match read_event()? {
+            LoopEvent::Resize(cols, rows) => {
+                let (w, h) = map::resolve_map_size(width, height, cols as usize, rows as usize);
+                if (w, h) != (game.map.width, game.map.height) {
+                    game.resize(w, h);
+                }
+            }
+            LoopEvent::Key(Key::Char('q')) | LoopEvent::Key(Key::Escape) => return Ok(()),
+            LoopEvent::Key(key) => {
                 let Some(dir) = key_to_direction(key) else { continue };
                 game.step(dir);
                 if game.won {
@@ -682,10 +746,10 @@ mod tests {
         // Map lines, then the §9 status line, then a hint/message line.
         let lines: Vec<&str> = frame.lines().collect();
         assert_eq!(lines.len(), TEST_MAP.len() + 2);
-        assert_eq!(
-            lines[TEST_MAP.len()],
-            "Level: 1  Gold: 0  Hp: 12(12)  Str: 16(16)  Arm: 4   Exp: 1/0"
-        );
+        // The status line is truncated to the 8-column fixture map so it
+        // never wraps; the full §9 format is `status_line()`'s own contract.
+        assert_eq!(lines[TEST_MAP.len()], "Level: 1");
+        assert!(game.status_line().starts_with("Level: 1  Gold: 0 "));
     }
 
     /// Round-order smoke: the player acts before monsters. A guaranteed-kill
@@ -892,5 +956,70 @@ mod tests {
         assert!(frame.contains(STAIRS_UP_GLYPH), "missing up stair glyph");
         assert!(frame.contains(AMULET_GLYPH), "missing Amulet glyph");
         assert_eq!(frame.matches('@').count(), 1);
+    }
+
+    /// A game fitted to a small terminal renders exactly the terminal's
+    /// height in rows — map, status line, hint line — with no line wider
+    /// than the terminal (nothing to wrap).
+    #[test]
+    fn fitted_game_renders_within_the_terminal_bounds() {
+        let (w, h) = map::fit_bounds(40, 15);
+        assert_eq!((w, h), (40, 13));
+        let game = Game::new(7, w, h);
+        let frame = game.render();
+        let lines: Vec<&str> = frame.lines().collect();
+        assert_eq!(lines.len(), 15, "map + status + hint");
+        assert!(lines.iter().all(|l| l.chars().count() <= 40), "no wrapped lines");
+        assert_eq!(lines.len(), game.map.height + 2);
+        assert!(lines[13].starts_with("Level: 1 "), "{} ", lines[13]);
+        assert!(lines[14].contains("seed"), "{}", lines[14]);
+    }
+
+    /// A terminal resize regenerates the floor at the new size, keeps the
+    /// player's stats (and position when it still lands on floor), and
+    /// renders within the new bounds.
+    #[test]
+    fn resize_regenerates_at_the_new_size_keeping_stats_and_position() {
+        let mut game = Game::new(7, crate::map::MAP_WIDTH, crate::map::MAP_HEIGHT);
+        // Make stat preservation observable.
+        game.player.hp = 5;
+        game.player.experience = 100;
+        let (px, py) = (game.player.x, game.player.y);
+
+        game.resize(40, 13);
+
+        assert_eq!((game.map.width, game.map.height), (40, 13));
+        assert_eq!(game.player.hp, 5, "resize must not reset the player");
+        assert_eq!(game.player.experience, 100);
+        assert!(game.player.x < 40 && game.player.y < 13);
+        assert!(
+            game.map.tile(game.player.x, game.player.y).is_walkable(),
+            "player lands on walkable floor"
+        );
+        if (game.player.x, game.player.y) == (px, py) {
+            assert!(px < 40 && py < 13, "kept position must be in-bounds");
+        }
+        let frame = game.render();
+        let lines: Vec<&str> = frame.lines().collect();
+        assert_eq!(lines.len(), 15);
+        assert!(lines.iter().all(|l| l.chars().count() <= 40));
+        assert!(lines[13].starts_with("Level: 1 "));
+    }
+
+    /// Resizing mid-descent stays on the same floor.
+    #[test]
+    fn resize_keeps_the_current_floor() {
+        let mut game = Game::new(7, crate::map::MAP_WIDTH, crate::map::MAP_HEIGHT);
+        game.step_onto(game.stairs.down);
+        assert_eq!(game.floor, 2);
+        let map_seed = levels::floor_seed(game.seed, game.floor);
+        game.resize(60, 20);
+        assert_eq!(game.floor, 2);
+        assert_eq!((game.map.width, game.map.height), (60, 20));
+        assert_eq!(
+            game.map.render(),
+            Dungeon::generate_sized(map_seed, 60, 20).render(),
+            "the resized floor regenerates deterministically"
+        );
     }
 }

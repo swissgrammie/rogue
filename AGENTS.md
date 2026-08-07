@@ -27,6 +27,13 @@ find the Amulet of Yendor and get out.
   `Game.floor` (1..=26) is the depth seam — `entity::populate(dungeon,
   floor, rng)` records it for combat's monster scaling, and the status line
   leads with `Level: N` per the combat report §9 format.
+- The map fits the terminal: interactive play sizes the map via
+  `map::fit_bounds`/`resolve_map_size` (width = columns, height = rows minus
+  the status/hint lines, floored at `MIN_FIT_*`), resizes regenerate the
+  current floor at the new size in the `run` loop, and maps smaller than the
+  3x3 room grid's native minimum get a single-room fallback in
+  `Dungeon::generate_sized` instead of panicking. Explicit `--width`/
+  `--height` override auto-fit; `--dump-map` keeps its 80x24 defaults.
 - This working copy is a Jujutsu (jj) workspace, not a plain git checkout.
   If $JJHOUSE_AGENT_GUIDE is set, read that file before touching version
   control. Never run raw git write commands; describe work with `jj describe`.

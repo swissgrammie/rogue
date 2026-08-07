@@ -17,8 +17,10 @@ Options:
                         the Amulet of Yendor waits on floor 26
       --seed <n>        Seed the generator (default: from the clock) for
                         reproducible maps
-      --width <n>       Map width in columns (default: 80)
-      --height <n>      Map height in rows (default: 24)
+      --width <n>       Map width in columns (default: fit the terminal;
+                         with --dump-map, 80)
+      --height <n>      Map height in rows (default: terminal rows minus the
+                         status/hint lines; with --dump-map, 24)
   -h, --help            Show this help
 
 Playing:
@@ -63,7 +65,8 @@ fn run(opts: Options) {
         return;
     }
 
-    if let Err(err) = rogue::game::run(seed, opts.width, opts.height) {
+    let (width, height) = opts.map_size_overrides();
+    if let Err(err) = rogue::game::run(seed, width, height) {
         eprintln!("rogue: {err}");
         std::process::exit(1);
     }
@@ -76,9 +79,21 @@ struct Options {
     floor: u32,
     width: usize,
     height: usize,
+    width_explicit: bool,
+    height_explicit: bool,
 }
 
 impl Options {
+    /// The interactive size: `None` per axis means "fit the terminal"; a
+    /// `Some` carries an explicit `--width`/`--height` override. The dump
+    /// path uses `width`/`height` directly and keeps its fixed defaults.
+    fn map_size_overrides(&self) -> (Option<usize>, Option<usize>) {
+        (
+            self.width_explicit.then_some(self.width),
+            self.height_explicit.then_some(self.height),
+        )
+    }
+
     fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Options, String> {
         let mut opts = Options {
             dump_map: false,
@@ -87,6 +102,8 @@ impl Options {
             floor: 1,
             width: map::MAP_WIDTH,
             height: map::MAP_HEIGHT,
+            width_explicit: false,
+            height_explicit: false,
         };
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -103,8 +120,14 @@ impl Options {
                         ));
                     }
                 }
-                "--width" => opts.width = parse_value(&arg, args.next())?,
-                "--height" => opts.height = parse_value(&arg, args.next())?,
+                "--width" => {
+                    opts.width = parse_value(&arg, args.next())?;
+                    opts.width_explicit = true;
+                }
+                "--height" => {
+                    opts.height = parse_value(&arg, args.next())?;
+                    opts.height_explicit = true;
+                }
                 other => return Err(format!("unrecognized argument `{other}`")),
             }
         }
