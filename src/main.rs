@@ -14,6 +14,9 @@ Options:
       --width <n>       Map width in columns (default: 80)
       --height <n>      Map height in rows (default: 24)
   -h, --help            Show this help
+
+Playing:
+  Move with h/j/k/l or the arrow keys; walls block movement. Press q to quit.
 ";
 
 fn main() {
@@ -32,15 +35,19 @@ fn run(opts: Options) {
         return;
     }
 
+    let seed = opts.seed.unwrap_or_else(seed_from_clock);
+    let dungeon = Dungeon::generate_sized(seed, opts.width, opts.height);
+
     if opts.dump_map {
-        let seed = opts.seed.unwrap_or_else(seed_from_clock);
-        let dungeon = Dungeon::generate_sized(seed, opts.width, opts.height);
         println!("seed: {seed}");
         print!("{}", dungeon.render());
         return;
     }
 
-    println!("rogue: nothing to play yet — try --dump-map (see --help)");
+    if let Err(err) = rogue::game::run(dungeon, seed) {
+        eprintln!("rogue: {err}");
+        std::process::exit(1);
+    }
 }
 
 struct Options {

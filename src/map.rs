@@ -132,6 +132,22 @@ impl Dungeon {
         dungeon
     }
 
+    /// Assemble a dungeon from raw tiles (row-major), for tests and tools
+    /// that need a level with known contents. No rooms are recorded.
+    pub fn from_tiles(width: usize, height: usize, tiles: &[Tile]) -> Dungeon {
+        assert_eq!(
+            tiles.len(),
+            width * height,
+            "tile count must match width * height"
+        );
+        Dungeon {
+            width,
+            height,
+            tiles: tiles.to_vec(),
+            rooms: [None; GRID_CELLS],
+        }
+    }
+
     pub fn tile(&self, x: usize, y: usize) -> Tile {
         self.tiles[y * self.width + x]
     }

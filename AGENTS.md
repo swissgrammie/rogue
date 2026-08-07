@@ -8,6 +8,9 @@ find the Amulet of Yendor and get out.
 - Keep modules small: map generation, entities, combat, FOV, UI, game loop.
   Game logic lives in the library (`src/lib.rs` + one module per concern);
   `src/main.rs` is a thin CLI shell over it, so modules stay unit-testable.
+  The play loop is `src/game.rs`: raw crossterm (raw mode + alternate screen)
+  until ratatui lands; input mapping and collision rules are pure functions
+  with unit tests there.
 - Inspect a generated level with `cargo run -- --dump-map --seed 1`; a seed
   makes any map reproducible, which is how the map tests stay stable.
 - This working copy is a Jujutsu (jj) workspace, not a plain git checkout.
