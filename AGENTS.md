@@ -39,6 +39,23 @@ find the Amulet of Yendor and get out.
   fallback in `Dungeon::generate_sized` instead of panicking. Explicit
   `--width`/`--height` override auto-fit; `--dump-map` keeps its 80x24
   defaults.
+- Terminal-free testability: `game::play(seed, width, height, &[Key])` runs
+  a scripted session with no terminal (deterministic for a seed; stops on
+  quit/death/escape), `game::script_keys` parses a key string (`h/j/k/l`,
+  `<left>`/`<right>`/`<up>`/`<down>`, `<esc>`, `q`), and
+  `game::Game::snapshot()` prints one compact final-state line. The CLI
+  exposes these as `rogue --script <keys> --seed N [--width/--height]`
+  (snapshot to stdout, exit 0) and `rogue --dump-frame [--floor N]
+  [--width/--height]` (the exact interactive frame — map + status + hint —
+  via the shared `Game::render`/`status_line`, default 80x24). The golden
+  harness lives in `tests/harness.rs`: no-overflow line counts at tiny
+  windows, deterministic-run snapshots, frame content at two sizes, and a
+  reactive walker (stealth paths around unwinnable monsters, hunting
+  winnable ones, sprinting the last steps) that records a key script and
+  replays it through the CLI. NOTE: a full 26-floor `won: true` journey is
+  currently unreachable — the monster table spawns at full table stats on
+  every floor and chasers are unshakeable, so every seed hits an unwinnable
+  guard (probe bottoms out around floor 8); see the walker test docs.
 - This working copy is a Jujutsu (jj) workspace, not a plain git checkout.
   If $JJHOUSE_AGENT_GUIDE is set, read that file before touching version
   control. Never run raw git write commands; describe work with `jj describe`.

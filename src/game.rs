@@ -144,8 +144,9 @@ impl Game {
     }
 
     /// Generate (or deterministically regenerate) the floor `floor` and
-    /// assemble a full game state around it.
-    fn at_floor(seed: u64, floor: u32, width: usize, height: usize) -> Game {
+    /// assemble a full game state around it. Public for tools (`--dump-frame
+    /// --floor N`) that want a specific floor's state without playing to it.
+    pub fn at_floor(seed: u64, floor: u32, width: usize, height: usize) -> Game {
         assert!((1..=MAX_FLOOR).contains(&floor), "floor {floor} out of range");
         let map = Dungeon::generate_sized(levels::floor_seed(seed, floor), width, height);
         Self::assemble(map, floor, seed)
@@ -426,6 +427,28 @@ impl Game {
         out
     }
 
+    /// One compact line summarizing the final state, for `--script` and the
+    /// golden tests: seed, floor, hp/max, str, gold, exp, level, won/dead,
+    /// monsters remaining, and whether the Amulet is carried. Dead and
+    /// escaped states are explicit (`dead: true` / `won: true`).
+    pub fn snapshot(&self) -> String {
+        format!(
+            "seed: {}  floor: {}  hp: {}/{}  str: {}  gold: {}  exp: {}  level: {}  won: {}  dead: {}  monsters: {}  amulet: {}",
+            self.seed,
+            self.floor,
+            self.player.hp,
+            self.player.max_hp,
+            self.player.strength,
+            self.player.gold,
+            self.player.experience,
+            self.player.level,
+            self.won,
+            self.player.hp <= 0,
+            self.monsters.len(),
+            self.has_amulet,
+        )
+    }
+
     /// Is the player standing on floor 1's exit stair?
     fn at_exit(&self) -> bool {
         self.floor == 1 && (self.player.x, self.player.y) == self.stairs.up
@@ -504,6 +527,60 @@ impl Drop for TerminalGuard {
         let _ = execute!(&mut out, Show, LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
+}
+
+/// Parse a script string into keys, for `--script` and the golden tests: a
+/// bare character is that key (`h`/`j`/`k`/`l`, `q`, ...); the arrow and
+/// escape keys are spelled `<left>`/`<right>`/`<up>`/`<down>`/`<esc>`.
+/// Unknown `<...>` tokens are an error so a typo cannot silently no-op.
+pub fn script_keys(script: &str) -> Result<Vec<Key>, String> {
+    let mut keys = Vec::new();
+    let mut rest = script;
+    while !rest.is_empty() {
+        if let Some(after_lt) = rest.strip_prefix('<')
+            && let Some(end) = after_lt.find('>')
+        {
+            let (token, tail) = after_lt.split_at(end);
+            let key = match token {
+                "left" => Key::Left,
+                "right" => Key::Right,
+                "up" => Key::Up,
+                "down" => Key::Down,
+                "esc" => Key::Escape,
+                other => return Err(format!("unknown key token `<{other}>`")),
+            };
+            keys.push(key);
+            rest = &tail[1..];
+            continue;
+        }
+        let c = rest.chars().next().expect("rest is non-empty");
+        keys.push(Key::Char(c.to_ascii_lowercase()));
+        rest = &rest[c.len_utf8()..];
+    }
+    Ok(keys)
+}
+
+/// Does the interactive loop treat `key` as quit (`q` or Escape)? The
+/// scripted loop uses the same rule so a script and a real session agree.
+fn is_quit(key: Key) -> bool {
+    matches!(key, Key::Char('q') | Key::Escape)
+}
+
+/// Run a scripted session with no terminal: apply each key exactly like the
+/// interactive loop would — `q`/Escape quits, unknown keys and blocked
+/// moves change nothing, and the game stops early once the player dies or
+/// escapes — then return the final state. Deterministic for a given seed,
+/// so scripts double as regression tests for whole runs.
+pub fn play(seed: u64, width: usize, height: usize, keys: &[Key]) -> Game {
+    let mut game = Game::new(seed, width, height);
+    for &key in keys {
+        if game.won || game.player.hp <= 0 || is_quit(key) {
+            break;
+        }
+        let Some(dir) = key_to_direction(key) else { continue };
+        game.step(dir);
+    }
+    game
 }
 
 /// Normalize one crossterm key event into our `Key` set.
@@ -675,6 +752,73 @@ mod tests {
             exp: base.exp,
             running: false,
         }
+    }
+
+    #[test]
+    fn script_keys_parse_chars_and_arrows() {
+        let keys = script_keys("h<left>j<right>k<up>l<down>q<esc>x").unwrap();
+        assert_eq!(
+            keys,
+            vec![
+                Key::Char('h'),
+                Key::Left,
+                Key::Char('j'),
+                Key::Right,
+                Key::Char('k'),
+                Key::Up,
+                Key::Char('l'),
+                Key::Down,
+                Key::Char('q'),
+                Key::Escape,
+                Key::Char('x'),
+            ]
+        );
+        assert_eq!(
+            script_keys("LL").unwrap(),
+            vec![Key::Char('l'), Key::Char('l')],
+            "lowercased"
+        );
+        assert!(script_keys("<nope>").is_err(), "unknown token is an error");
+        assert_eq!(script_keys("").unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn play_applies_the_script_like_the_interactive_loop() {
+        // An 8x4 map is a single room centered at (3,1). h/west then
+        // j/south land cleanly on seed 1 (no monster in the way).
+        let game = play(1, 8, 4, &script_keys("hj").unwrap());
+        assert_eq!((game.player.x, game.player.y), (2, 2));
+        // Unknown keys change nothing; blocked moves change nothing.
+        let game = play(1, 8, 4, &script_keys("zh").unwrap());
+        assert_eq!((game.player.x, game.player.y), (2, 1));
+    }
+
+    #[test]
+    fn play_stops_at_quit_death_and_escape() {
+        // `q` stops the script: later keys are ignored.
+        let quit = play(7, crate::map::MAP_WIDTH, 22, &script_keys("qll").unwrap());
+        assert_eq!(
+            (quit.player.x, quit.player.y),
+            (quit.map.rooms()[0].center().0, quit.map.rooms()[0].center().1)
+        );
+        assert_eq!(quit.player.hp, 12);
+        // Escape quits too.
+        let esc = play(7, crate::map::MAP_WIDTH, 22, &script_keys("<esc>l").unwrap());
+        assert_eq!(esc.snapshot(), quit.snapshot());
+    }
+
+    #[test]
+    fn snapshot_reports_the_final_state_explicitly() {
+        let game = play(7, crate::map::MAP_WIDTH, 22, &[]);
+        let snap = game.snapshot();
+        assert!(
+            snap.starts_with("seed: 7  floor: 1  hp: 12/12  str: 16  gold: 0  exp: 0  level: 1 "),
+            "{snap}"
+        );
+        assert!(snap.contains("won: false"), "{snap}");
+        assert!(snap.contains("dead: false"), "{snap}");
+        assert!(snap.contains("monsters: "), "{snap}");
+        assert!(snap.contains("amulet: false"), "{snap}");
     }
 
     #[test]
