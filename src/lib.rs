@@ -6,5 +6,6 @@
 pub mod combat;
 pub mod entity;
 pub mod game;
+pub mod levels;
 pub mod map;
 pub mod rng;

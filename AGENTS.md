@@ -18,6 +18,15 @@ find the Amulet of Yendor and get out.
   were verified against Rogue 5.4.4 in the combat research report.
 - Inspect a generated level with `cargo run -- --dump-map --seed 1`; a seed
   makes any map reproducible, which is how the map tests stay stable.
+  `--floor N` dumps a specific floor; `--seed 1 --floor 26` shows the Amulet.
+- Level progression (stairs, floor counter, Amulet, win) lives in
+  `src/levels.rs`: `MAX_FLOOR`/`AMULET_LEVEL = 26`, `floor_seed(base, floor)`
+  (floor 1 = base seed; re-ascending regenerates the floor above
+  deterministically), and stair/Amulet placement on room floor tiles. The
+  game loop drives descents/ascents from `Game` state in `src/game.rs`;
+  `Game.floor` (1..=26) is the depth seam — `entity::populate(dungeon,
+  floor, rng)` records it for combat's monster scaling, and the status line
+  leads with `Level: N` per the combat report §9 format.
 - This working copy is a Jujutsu (jj) workspace, not a plain git checkout.
   If $JJHOUSE_AGENT_GUIDE is set, read that file before touching version
   control. Never run raw git write commands; describe work with `jj describe`.
