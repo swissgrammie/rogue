@@ -13,14 +13,20 @@ Usage:
 
 Options:
       --dump-map        Print a generated dungeon floor as ASCII and exit
+      --dump-frame      Print the interactive frame (map, status line, hint
+                        line) as plain text and exit; the map is fit inside
+                        the window (default: 80x24)
+      --script <keys>   Run a scripted session with no terminal and print a
+                        final-state snapshot; keys are h/j/k/l or
+                        <left>/<right>/<up>/<down>, q quits
       --floor <n>       Dungeon floor to dump or start on (1..=26, default: 1);
                         the Amulet of Yendor waits on floor 26
       --seed <n>        Seed the generator (default: from the clock) for
                         reproducible maps
-      --width <n>       Map width in columns (default: fit the terminal;
-                         with --dump-map, 80)
-      --height <n>      Map height in rows (default: terminal rows minus the
-                         status/hint lines; with --dump-map, 24)
+      --width <n>       Window width in columns for --dump-frame/--script
+                        (default: 80); with --dump-map, the map width
+      --height <n>      Window height in rows for --dump-frame/--script
+                        (default: 24); with --dump-map, the map height
   -h, --help            Show this help
 
 Playing:
@@ -65,6 +71,32 @@ fn run(opts: Options) {
         return;
     }
 
+    if opts.dump_frame {
+        // The exact frame the interactive loop renders, as plain text: map
+        // rows plus the status and hint lines. The map is fit inside the
+        // window (explicit --width/--height or the 80x24 default), so the
+        // frame is always exactly `rows` lines.
+        let (cols, rows) = opts.window_size();
+        let (w, h) = map::fit_bounds(cols, rows);
+        let game = game::Game::at_floor(seed, floor, w, h);
+        print!("{}", game.render());
+        return;
+    }
+
+    if let Some(script) = &opts.script {
+        let keys = game::script_keys(script).unwrap_or_else(|message| {
+            eprintln!("rogue: {message}\n\n{USAGE}");
+            std::process::exit(2);
+        });
+        // Same window contract as --dump-frame: the map is fit inside the
+        // window so a scripted run sees exactly the interactive layout.
+        let (cols, rows) = opts.window_size();
+        let (w, h) = map::fit_bounds(cols, rows);
+        let game = game::play(seed, w, h, &keys);
+        println!("{}", game.snapshot());
+        return;
+    }
+
     let (width, height) = opts.map_size_overrides();
     if let Err(err) = rogue::game::run(seed, width, height) {
         eprintln!("rogue: {err}");
@@ -74,6 +106,8 @@ fn run(opts: Options) {
 
 struct Options {
     dump_map: bool,
+    dump_frame: bool,
+    script: Option<String>,
     help: bool,
     seed: Option<u64>,
     floor: u32,
@@ -84,6 +118,17 @@ struct Options {
 }
 
 impl Options {
+    /// The window the scripted and frame-dump modes frame: explicit
+    /// `--width`/`--height` overrides, else the classic 80x24 extent. The
+    /// map is fit inside, so the frame is exactly `rows` lines — the map
+    /// plus the status and hint lines never exceed the window.
+    fn window_size(&self) -> (usize, usize) {
+        (
+            if self.width_explicit { self.width } else { map::MAP_WIDTH },
+            if self.height_explicit { self.height } else { map::MAP_HEIGHT },
+        )
+    }
+
     /// The interactive size: `None` per axis means "fit the terminal"; a
     /// `Some` carries an explicit `--width`/`--height` override. The dump
     /// path uses `width`/`height` directly and keeps its fixed defaults.
@@ -97,6 +142,8 @@ impl Options {
     fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Options, String> {
         let mut opts = Options {
             dump_map: false,
+            dump_frame: false,
+            script: None,
             help: false,
             seed: None,
             floor: 1,
@@ -109,6 +156,10 @@ impl Options {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--dump-map" => opts.dump_map = true,
+                "--dump-frame" => opts.dump_frame = true,
+                "--script" => {
+                    opts.script = Some(parse_value::<String>(&arg, args.next())?);
+                }
                 "-h" | "--help" => opts.help = true,
                 "--seed" => opts.seed = Some(parse_value(&arg, args.next())?),
                 "--floor" => {
@@ -130,6 +181,13 @@ impl Options {
                 }
                 other => return Err(format!("unrecognized argument `{other}`")),
             }
+        }
+        let modes = [opts.dump_map, opts.dump_frame, opts.script.is_some()]
+            .into_iter()
+            .filter(|&m| m)
+            .count();
+        if modes > 1 {
+            return Err("`--dump-map`, `--dump-frame` and `--script` are mutually exclusive".into());
         }
         Ok(opts)
     }
@@ -181,6 +239,26 @@ mod tests {
     #[test]
     fn defaults_to_no_seed() {
         assert_eq!(parse(&[]).expect("should parse").seed, None);
+    }
+
+    #[test]
+    fn parses_script_and_dump_frame() {
+        let opts = parse(&["--script", "lll", "--seed", "7", "--width", "60", "--height", "14"])
+            .expect("should parse");
+        assert_eq!(opts.script.as_deref(), Some("lll"));
+        assert_eq!(opts.window_size(), (60, 14));
+        let opts = parse(&["--dump-frame", "--floor", "26"]).expect("should parse");
+        assert!(opts.dump_frame);
+        assert_eq!(opts.floor, 26);
+        assert_eq!(opts.window_size(), (map::MAP_WIDTH, map::MAP_HEIGHT), "80x24 default");
+    }
+
+    #[test]
+    fn new_modes_are_mutually_exclusive() {
+        assert!(parse(&["--dump-map", "--dump-frame"]).is_err());
+        assert!(parse(&["--dump-frame", "--script", "l"]).is_err());
+        assert!(parse(&["--dump-map", "--script", "l"]).is_err());
+        assert!(parse(&["--script", "l", "--dump-map", "--dump-frame"]).is_err());
     }
 
     #[test]
