@@ -11,23 +11,24 @@ use crate::rng::Rng;
 pub const MAP_WIDTH: usize = 80;
 pub const MAP_HEIGHT: usize = 24;
 
-/// Floor for auto-fitting the map to the terminal ([`fit_bounds`]).
-///
-/// Any terminal at least [`MIN_FIT_WIDTH`] columns wide and
-/// `MIN_FIT_HEIGHT + 2` rows tall (the two reserved UI lines) gets a map
-/// that fits exactly; anything smaller still generates a playable level via
-/// the tiny-map fallback in [`Dungeon::generate_sized`] instead of
-/// panicking. The width floor is the 3x3 room grid's native minimum; the
-/// height floor (13) sits below the grid's 18-row minimum, so a short
-/// window like 40x15 degrades to a single-room level rather than
-/// overflowing.
-pub const MIN_FIT_WIDTH: usize = GRID_COLS * (MIN_ROOM_WIDTH + 2 * CELL_MARGIN);
-pub const MIN_FIT_HEIGHT: usize = 13;
+/// The smallest map the 3x3 room grid can fill: 24 columns by 18 rows.
+/// Anything smaller (a short or narrow terminal window, an explicit small
+/// `--width`/`--height`) still gets a playable level via the single-room
+/// fallback in [`Dungeon::generate_sized`] instead of panicking.
+pub const GRID_MIN_WIDTH: usize = GRID_COLS * (MIN_ROOM_WIDTH + 2 * CELL_MARGIN);
+pub const GRID_MIN_HEIGHT: usize = GRID_ROWS * (MIN_ROOM_HEIGHT + 2 * CELL_MARGIN);
+
+/// The absolute safety floor for a map size: never a 0-row or 0-column
+/// map, even from a degenerate `terminal::size()` result. At any real
+/// window size it never binds (an auto height is `rows - 2`, which is at
+/// least 1 from 3 rows up), so it can never push the map past the
+/// terminal's rows.
+pub const MIN_MAP_SIZE: usize = 1;
 
 /// The map size that fits a `cols`x`rows` terminal: the full width, and the
 /// height minus the two reserved lines below the map (the status line and
-/// the hint/message line), both floored at [`MIN_FIT_WIDTH`] x
-/// [`MIN_FIT_HEIGHT`].
+/// the hint/message line). Map rows plus those two lines never exceed the
+/// terminal's rows, at any window size.
 pub fn fit_bounds(cols: usize, rows: usize) -> (usize, usize) {
     resolve_map_size(None, None, cols, rows)
 }
@@ -36,20 +37,23 @@ pub fn fit_bounds(cols: usize, rows: usize) -> (usize, usize) {
 ///
 /// `width`/`height` are explicit `--width`/`--height` overrides when given
 /// (`Some`) and terminal auto-fit otherwise (`None`): an auto width is the
-/// terminal's column count, an auto height is the row count minus the two
-/// reserved UI lines. Every result is floored at the [`MIN_FIT_WIDTH`] x
-/// [`MIN_FIT_HEIGHT`] minimums, so a degenerate `terminal::size()` result
-/// can never ask the generator for a useless sliver of a map.
+/// terminal's column count and an auto height is the row count minus the
+/// two reserved UI lines, so a short window gets a small map rather than
+/// one that wraps (map rows + the two UI lines never exceed the window).
+/// The only floor is the absolute [`MIN_MAP_SIZE`] (never a 0-row or
+/// 0-column map from a degenerate `terminal::size()` result); anything
+/// below the 3x3 grid's native minimum is the generator's job, which it
+/// handles with the single-room fallback.
 pub fn resolve_map_size(
     width: Option<usize>,
     height: Option<usize>,
     cols: usize,
     rows: usize,
 ) -> (usize, usize) {
-    let w = width.unwrap_or(cols).max(MIN_FIT_WIDTH);
+    let w = width.unwrap_or(cols).max(MIN_MAP_SIZE);
     let h = match height {
-        Some(h) => h.max(MIN_FIT_HEIGHT),
-        None => rows.saturating_sub(2).max(MIN_FIT_HEIGHT),
+        Some(h) => h.max(MIN_MAP_SIZE),
+        None => rows.saturating_sub(2).max(MIN_MAP_SIZE),
     };
     (w, h)
 }
@@ -144,8 +148,7 @@ impl Dungeon {
     }
 
     pub fn generate_sized(seed: u64, width: usize, height: usize) -> Dungeon {
-        let min_width = GRID_COLS * (MIN_ROOM_WIDTH + 2 * CELL_MARGIN);
-        let min_height = GRID_ROWS * (MIN_ROOM_HEIGHT + 2 * CELL_MARGIN);
+        let (min_width, min_height) = (GRID_MIN_WIDTH, GRID_MIN_HEIGHT);
         if width < min_width || height < min_height {
             return Dungeon::generate_tiny(seed, width, height);
         }
@@ -626,12 +629,53 @@ mod tests {
         assert_eq!(fit_bounds(120, 40), (120, 38));
     }
 
+    /// The invariant: map rows plus the two UI lines must fit the terminal,
+    /// and the map must never exceed the columns, at any window size.
+    /// (Below 3 rows no size can hold two UI lines, so that degenerate
+    /// range is skipped.)
     #[test]
-    fn fit_bounds_never_drops_below_the_minimums() {
-        assert_eq!(fit_bounds(10, 10), (MIN_FIT_WIDTH, MIN_FIT_HEIGHT));
-        assert_eq!(fit_bounds(0, 0), (MIN_FIT_WIDTH, MIN_FIT_HEIGHT));
-        // A 3-row terminal leaves 1 row after the two reserved lines.
-        assert_eq!(fit_bounds(10, 3), (MIN_FIT_WIDTH, MIN_FIT_HEIGHT));
+    fn fit_bounds_never_exceed_the_terminal() {
+        for (cols, rows) in [
+            (80, 24),
+            (120, 40),
+            (80, 12),
+            (80, 10),
+            (40, 12),
+            (30, 14),
+            (80, 6),
+            (24, 6),
+            (10, 6),
+            (5, 3),
+            (3, 3),
+        ] {
+            let (w, h) = fit_bounds(cols, rows);
+            assert!(h + 2 <= rows, "{cols}x{rows}: map {w}x{h} overflows the window");
+            assert!(w <= cols, "{cols}x{rows}: map {w}x{h} overflows the columns");
+        }
+    }
+
+    /// The old `MIN_FIT_HEIGHT` floor (13) made an 80x12 terminal receive a
+    /// 13-row map plus two UI lines: 15 rows in a 12-row window. The height
+    /// is now `rows - 2` all the way down — a small map beats a wrapped one.
+    #[test]
+    fn fit_bounds_height_is_rows_minus_two_below_the_old_floor() {
+        assert_eq!(fit_bounds(80, 12), (80, 10));
+        assert_eq!(fit_bounds(80, 10), (80, 8));
+        assert_eq!(fit_bounds(40, 12), (40, 10));
+        assert_eq!(fit_bounds(30, 14), (30, 12));
+        assert_eq!(fit_bounds(80, 6), (80, 4));
+        assert_eq!(fit_bounds(80, 3), (80, 1));
+    }
+
+    /// The only floor left is the absolute one: never a 0-row or 0-column
+    /// map, even from a degenerate `terminal::size()` result. Anything
+    /// below the grid's native minimum is the generator's tiny-map job.
+    #[test]
+    fn fit_bounds_has_only_an_absolute_floor() {
+        assert_eq!(fit_bounds(0, 0), (1, 1));
+        assert_eq!(fit_bounds(0, 2), (1, 1));
+        assert_eq!(fit_bounds(0, 30), (1, 28));
+        assert_eq!(fit_bounds(40, 0), (40, 1));
     }
 
     #[test]
@@ -639,11 +683,11 @@ mod tests {
         assert_eq!(resolve_map_size(Some(100), Some(30), 40, 15), (100, 30));
         assert_eq!(resolve_map_size(Some(100), None, 40, 15), (100, 13));
         assert_eq!(resolve_map_size(None, Some(30), 40, 15), (40, 30));
-        // ...and are still floored at the minimums.
-        assert_eq!(
-            resolve_map_size(Some(5), Some(5), 40, 15),
-            (MIN_FIT_WIDTH, MIN_FIT_HEIGHT)
-        );
+        // Explicit sizes pass through as asked (the generator clamps anything
+        // below its native minimum to a playable single room); only the
+        // absolute zero floor still applies.
+        assert_eq!(resolve_map_size(Some(5), Some(5), 40, 15), (5, 5));
+        assert_eq!(resolve_map_size(Some(0), Some(0), 40, 15), (1, 1));
     }
 
     #[test]

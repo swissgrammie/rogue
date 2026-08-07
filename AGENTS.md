@@ -10,7 +10,10 @@ find the Amulet of Yendor and get out.
   `src/main.rs` is a thin CLI shell over it, so modules stay unit-testable.
   The play loop is `src/game.rs`: raw crossterm (raw mode + alternate screen)
   until ratatui lands; input mapping and collision rules are pure functions
-  with unit tests there.
+  with unit tests there. The loop redraws only when the state changed
+  (`Game::step` returns whether it did; blocked moves and unknown keys draw
+  nothing) and overwrites the fixed-size frame instead of clearing the whole
+  screen.
 - Combat is `src/combat.rs`: swing/roll_em/killed/check_level and the fight
   round (player acts, then runners → doctor → hunger). The monster table in
   `src/entity.rs` is the Rogue 5.4.4 Aquator…Zombie set (exp/lvl/arm/dmg
@@ -29,11 +32,13 @@ find the Amulet of Yendor and get out.
   leads with `Level: N` per the combat report §9 format.
 - The map fits the terminal: interactive play sizes the map via
   `map::fit_bounds`/`resolve_map_size` (width = columns, height = rows minus
-  the status/hint lines, floored at `MIN_FIT_*`), resizes regenerate the
+  the status/hint lines, so map rows + the two UI lines never exceed the
+  terminal; only an absolute 1x1 floor remains), resizes regenerate the
   current floor at the new size in the `run` loop, and maps smaller than the
-  3x3 room grid's native minimum get a single-room fallback in
-  `Dungeon::generate_sized` instead of panicking. Explicit `--width`/
-  `--height` override auto-fit; `--dump-map` keeps its 80x24 defaults.
+  3x3 room grid's native minimum (`map::GRID_MIN_*`) get a single-room
+  fallback in `Dungeon::generate_sized` instead of panicking. Explicit
+  `--width`/`--height` override auto-fit; `--dump-map` keeps its 80x24
+  defaults.
 - This working copy is a Jujutsu (jj) workspace, not a plain git checkout.
   If $JJHOUSE_AGENT_GUIDE is set, read that file before touching version
   control. Never run raw git write commands; describe work with `jj describe`.

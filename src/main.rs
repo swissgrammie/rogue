@@ -6,7 +6,7 @@ use rogue::rng::Rng;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const USAGE: &str = "\
-rogue — a terminal roguelike
+rogue - a terminal roguelike
 
 Usage:
   rogue [options]

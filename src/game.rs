@@ -183,12 +183,17 @@ impl Game {
     /// Staircases and the Amulet are handled between the player action and
     /// the AFTER phase, so descending moves the player before the new
     /// floor's monsters act.
-    pub fn step(&mut self, dir: Direction) {
+    ///
+    /// Returns whether the game state changed (a move, a fight — hit, miss,
+    /// or counterattack — or a floor/win transition). A blocked move (wall
+    /// or map edge) changes nothing and returns `false`, which the play loop
+    /// uses to skip redrawing.
+    pub fn step(&mut self, dir: Direction) -> bool {
         // 1. Player action. Moving into a monster starts a fight; the target
         //    is woken (runto) before the swing, so the player never benefits
         //    from the +4 "defender not running" bonus (report §4.4).
         let Some((nx, ny)) = next_position(self.player.x, self.player.y, dir) else {
-            return;
+            return false;
         };
         let mut fought = false;
         if let Some(monster) = self.monsters.iter_mut().find(|m| m.x == nx && m.y == ny) {
@@ -200,7 +205,7 @@ impl Game {
             );
             self.last_message = Some(if monster.hp <= 0 {
                 format!(
-                    "You scored an excellent hit on the {} — you have defeated the {}",
+                    "You scored an excellent hit on the {} - you have defeated the {}",
                     monster.name(),
                     monster.name()
                 )
@@ -214,14 +219,14 @@ impl Game {
             self.player.x = nx;
             self.player.y = ny;
         } else {
-            return; // thud: a blocked step consumes no turn
+            return false; // thud: a blocked step consumes no turn
         }
         self.player.running = true;
 
         // 2. Level features: pick up the Amulet, take a staircase, win.
         self.after_move();
         if self.won {
-            return;
+            return true;
         }
 
         // 3. AFTER phase: runners → doctor → stomach.
@@ -250,6 +255,7 @@ impl Game {
         if self.player.hp <= 0 {
             self.last_message = Some("you have died".to_string());
         }
+        true
     }
 
     /// Move the player one tile in `dir`; returns whether the position
@@ -403,7 +409,7 @@ impl Game {
         match &self.last_message {
             Some(message) => out.push_str(&Self::fit_line(message, self.map.width)),
             None => out.push_str(&Self::fit_line(
-                &format!("seed {} — h/j/k/l or arrows move, q quits", self.seed),
+                &format!("seed {} - h/j/k/l or arrows move, q quits", self.seed),
                 self.map.width,
             )),
         }
@@ -411,10 +417,13 @@ impl Game {
         out
     }
 
-    /// Truncate one UI line to `width` characters, so a narrow terminal never
-    /// wraps the status or hint lines.
+    /// Fit one UI line to exactly `width` characters: truncate long lines so
+    /// a narrow terminal never wraps them, and pad short lines so an
+    /// overwrite never leaves stale text from an earlier, longer line.
     fn fit_line(line: &str, width: usize) -> String {
-        line.chars().take(width).collect()
+        let mut out: String = line.chars().take(width).collect();
+        out.extend(std::iter::repeat(' ').take(width - out.chars().count()));
+        out
     }
 
     /// Is the player standing on floor 1's exit stair?
@@ -422,9 +431,14 @@ impl Game {
         self.floor == 1 && (self.player.x, self.player.y) == self.stairs.up
     }
 
-    /// Repaint the whole frame.
+    /// Overwrite the whole frame. The frame is a fixed size — map rows plus
+    /// the status and hint lines, every line exactly the map's width — so a
+    /// draw at an unchanged size replaces every cell with no clear and no
+    /// flicker. A resize clears the old frame's stale rows first (see
+    /// `run`), and the alternate screen starts blank, so the display never
+    /// accumulates leftover text.
     fn draw(&self, out: &mut impl Write) -> io::Result<()> {
-        execute!(out, MoveTo(0, 0), Clear(ClearType::All))?;
+        execute!(out, MoveTo(0, 0))?;
         write!(out, "{}", self.render())?;
         out.flush()
     }
@@ -579,19 +593,35 @@ pub fn run(seed: u64, width: Option<usize>, height: Option<usize>) -> io::Result
         if game.player.hp <= 0 {
             return Ok(()); // the frame above shows "you have died"
         }
-        match read_event()? {
-            LoopEvent::Resize(cols, rows) => {
-                let (w, h) = map::resolve_map_size(width, height, cols as usize, rows as usize);
-                if (w, h) != (game.map.width, game.map.height) {
-                    game.resize(w, h);
+        // The frame on screen is current; wait for an event that actually
+        // changes the game. Unknown keys and blocked moves change nothing
+        // and are ignored without a redraw, so an idle terminal stays
+        // perfectly still instead of flickering.
+        loop {
+            match read_event()? {
+                LoopEvent::Resize(cols, rows) => {
+                    let (w, h) =
+                        map::resolve_map_size(width, height, cols as usize, rows as usize);
+                    if (w, h) != (game.map.width, game.map.height) {
+                        game.resize(w, h);
+                        // A new size: drop the old frame's stale rows, then
+                        // redraw the regenerated floor below.
+                        execute!(out, Clear(ClearType::All))?;
+                        break;
+                    }
+                    // Same size: nothing changed, keep waiting.
                 }
-            }
-            LoopEvent::Key(Key::Char('q')) | LoopEvent::Key(Key::Escape) => return Ok(()),
-            LoopEvent::Key(key) => {
-                let Some(dir) = key_to_direction(key) else { continue };
-                game.step(dir);
-                if game.won {
-                    return escape_screen(&mut out, &game);
+                LoopEvent::Key(Key::Char('q')) | LoopEvent::Key(Key::Escape) => return Ok(()),
+                LoopEvent::Key(key) => {
+                    let Some(dir) = key_to_direction(key) else { continue };
+                    let changed = game.step(dir);
+                    if game.won {
+                        return escape_screen(&mut out, &game);
+                    }
+                    if changed {
+                        break; // redraw the new state below
+                    }
+                    // A blocked move: nothing changed, keep waiting.
                 }
             }
         }
@@ -973,6 +1003,29 @@ mod tests {
         assert_eq!(lines.len(), game.map.height + 2);
         assert!(lines[13].starts_with("Level: 1 "), "{} ", lines[13]);
         assert!(lines[14].contains("seed"), "{}", lines[14]);
+    }
+
+    /// The invariant end to end: a game fitted to a short window renders
+    /// exactly the window's height in rows — map, status line, hint line —
+    /// with every line exactly the map width (nothing to wrap, no stale
+    /// tail), including windows the old `MIN_FIT_HEIGHT` floor overflowed.
+    #[test]
+    fn fitted_game_renders_within_short_terminals() {
+        for (cols, rows) in [(80, 10), (40, 12), (30, 14), (80, 12), (80, 6), (24, 6)] {
+            let (w, h) = map::fit_bounds(cols, rows);
+            assert_eq!(h + 2, rows, "{cols}x{rows}: map + UI must fit the window");
+            let game = Game::new(7, w, h);
+            let frame = game.render();
+            let lines: Vec<&str> = frame.lines().collect();
+            assert_eq!(lines.len(), rows, "{cols}x{rows}: map + status + hint");
+            assert_eq!(lines.len(), game.map.height + 2, "{cols}x{rows}");
+            assert!(
+                lines.iter().all(|l| l.chars().count() == w),
+                "{cols}x{rows}: every line exactly the map width"
+            );
+            assert!(lines[h].starts_with("Level: 1 "), "{cols}x{rows}: {}", lines[h]);
+            assert!(lines[h + 1].contains("seed"), "{cols}x{rows}: {}", lines[h + 1]);
+        }
     }
 
     /// A terminal resize regenerates the floor at the new size, keeps the
