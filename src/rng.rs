@@ -13,7 +13,10 @@ impl Rng {
         }
     }
 
-    fn next_u64(&mut self) -> u64 {
+    /// The raw xorshift64* stream: one avalanche pass. Exposed so other
+    /// modules can derive deterministic sub-seeds (e.g. one seed per dungeon
+    /// floor) without duplicating the avalanche constants.
+    pub fn next_u64(&mut self) -> u64 {
         let mut x = self.state;
         x ^= x >> 12;
         x ^= x << 25;
