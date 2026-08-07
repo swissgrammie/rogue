@@ -40,7 +40,7 @@ fn run(opts: Options) {
     let dungeon = Dungeon::generate_sized(seed, opts.width, opts.height);
 
     if opts.dump_map {
-        let spawn = entity::populate_seeded(&dungeon, seed);
+        let spawn = entity::populate_seeded(&dungeon, 1, seed);
         println!("seed: {seed}");
         print!("{}", dungeon.render());
         println!("{}", spawn.summary());

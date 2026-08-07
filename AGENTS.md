@@ -11,6 +11,11 @@ find the Amulet of Yendor and get out.
   The play loop is `src/game.rs`: raw crossterm (raw mode + alternate screen)
   until ratatui lands; input mapping and collision rules are pure functions
   with unit tests there.
+- Combat is `src/combat.rs`: swing/roll_em/killed/check_level and the fight
+  round (player acts, then runners → doctor → hunger). The monster table in
+  `src/entity.rs` is the Rogue 5.4.4 Aquator…Zombie set (exp/lvl/arm/dmg
+  columns); monster HP is `roll(lvl, 8)` at spawn, not a table stat. Formulas
+  were verified against Rogue 5.4.4 in the combat research report.
 - Inspect a generated level with `cargo run -- --dump-map --seed 1`; a seed
   makes any map reproducible, which is how the map tests stay stable.
 - This working copy is a Jujutsu (jj) workspace, not a plain git checkout.

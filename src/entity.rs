@@ -1,15 +1,14 @@
-//! Entities: the player, monsters, and the classic Rogue monster table.
+//! Entities: the player, monsters, and the classic Rogue 5.4.4 monster table.
 //!
-//! Data model only. Combat math is deliberately absent — a separate combat
-//! report will define the formulas — so everything here is plain data with a
-//! small, documented API for the game loop and combat modules to build on.
+//! Data model only — combat math lives in `crate::combat`, which consumes
+//! the table's `exp`/`lvl`/`arm`/`dmg` columns (report §12). Positions are
+//! `(x, y)` map coordinates (column, row), matching the map module.
 //!
-//! Monsters follow the classic Rogue monster table from the original 1980
-//! game (*Rogue: Exploring the Dungeons of Doom*, Toy/Wichman/Arnold): all 26
-//! monsters, one per letter A–Z from Aquator to Zombie, with the canonical
-//! hit points, armor class, damage dice and experience values (see
-//! [`MonsterKind::stats`]). Positions are `(x, y)` map coordinates (column,
-//! row), matching the map module.
+//! Monsters follow the canonical Aquator…Zombie table of Rogue 5.4.4 (the
+//! final classic release): all 26 monsters, one per letter A–Z, with the
+//! canonical experience, level, armor class and damage strings (see
+//! [`MonsterKind::stats`]). The table's `hpt` column is an unused placeholder
+//! in the original — real hit points are `roll(lvl, 8)` at spawn ([`Monster::spawn`]).
 
 use crate::map::{Dungeon, Tile};
 use crate::rng::Rng;
@@ -31,6 +30,8 @@ pub const PLAYER_START_LEVEL: u32 = 1;
 ///
 /// Classic Rogue attributes — hit points, strength, gold and experience —
 /// are tracked here; combat and the game loop read and mutate the fields.
+/// The player's weapon and armor live in `combat` (the starting mace and
+/// ring mail) until the items task lands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Player {
     pub x: usize,
@@ -41,6 +42,10 @@ pub struct Player {
     pub gold: i32,
     pub experience: i32,
     pub level: u32,
+    /// ISRUN: awake and active. Set when the player takes an action; combat
+    /// clears it for disabled (frozen/sleeping) players, who are then easier
+    /// to hit (the +4 "defender not running" bonus, report §4.4).
+    pub running: bool,
 }
 
 impl Player {
@@ -55,6 +60,7 @@ impl Player {
             gold: PLAYER_START_GOLD,
             experience: PLAYER_START_EXPERIENCE,
             level: PLAYER_START_LEVEL,
+            running: true,
         }
     }
 
@@ -64,45 +70,29 @@ impl Player {
     }
 }
 
-/// Damage dice in classic Rogue "AxB" notation: `dice` rolls of a `sides`-sided
-/// die (`1x4` is 1d4; `0x0` deals nothing). Pure data — the roll formula
-/// belongs to the combat module.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Damage {
-    pub dice: u32,
-    pub sides: u32,
-}
-
-impl Damage {
-    pub const fn new(dice: u32, sides: u32) -> Damage {
-        Damage { dice, sides }
-    }
-
-    /// No damage at all ("0x0"), e.g. the fungus, which paralyses instead.
-    pub const fn none() -> Damage {
-        Damage::new(0, 0)
-    }
-}
-
-impl fmt::Display for Damage {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}x{}", self.dice, self.sides)
-    }
-}
-
 /// The canonical, static stats of one monster kind, straight from the classic
-/// Rogue monster table.
+/// Rogue 5.4.4 monster table (`extern.c:188`). Combat consumes the `exp`,
+/// `level`, `armor_class` and `damage` columns (report §12); hit points are
+/// NOT a table stat — they are `roll(level, 8)` at spawn ([`Monster::spawn`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MonsterStats {
-    /// Base hit points, also the max a freshly spawned monster starts with.
-    pub hit_points: i32,
-    /// Armor class. In the original Rogue this is the number an attacker must
-    /// beat to land a blow; the combat module owns the exact formula.
-    pub armor_class: i32,
-    /// Damage dice, e.g. `1x4` for 1d4.
-    pub damage: Damage,
-    /// Experience awarded for killing it.
+    /// Base experience awarded for killing it (`exp` column).
     pub exp: i32,
+    /// Base level (`lvl` column): the monster's attacker level in `swing()`
+    /// and the dice count for spawn HP.
+    pub level: u32,
+    /// Armor class (`arm` column). Lower is better; can be negative
+    /// (dragon −1, black unicorn −2), which makes those monsters *harder*
+    /// to hit.
+    pub armor_class: i32,
+    /// Damage string (`dmg` column) in `"NdS[/NdS…]"` form: `'x'` separates
+    /// dice from sides (`"2x4"` = 2d4), `'/'` separates independent attacks
+    /// each with its own to-hit roll. `"0x0"` deals no damage; the flytrap's
+    /// `"%%%x0"` is a runtime-rewritten placeholder that parses as `0x0`.
+    pub damage: &'static str,
+    /// ISMEAN: only mean monsters wake on sight and chase the player
+    /// (report §7.2). Greedy monsters chase gold instead and stay put.
+    pub is_mean: bool,
 }
 
 /// One of the 26 classic Rogue monsters, one per letter A–Z.
@@ -115,22 +105,22 @@ pub enum MonsterKind {
     Centaur,
     Dragon,
     Emu,
-    Fungus,
-    Giant,
+    Flytrap,
+    Griffin,
     Hobgoblin,
     IceMonster,
     Jabberwock,
-    Kobold,
+    Kestrel,
     Leprechaun,
     Medusa,
-    Naga,
+    Nymph,
     Orc,
     Phantom,
     Quagga,
-    Rat,
+    Rattlesnake,
     Snake,
     Troll,
-    UrVile,
+    BlackUnicorn,
     Vampire,
     Wraith,
     Xeroc,
@@ -146,22 +136,22 @@ impl MonsterKind {
         MonsterKind::Centaur,
         MonsterKind::Dragon,
         MonsterKind::Emu,
-        MonsterKind::Fungus,
-        MonsterKind::Giant,
+        MonsterKind::Flytrap,
+        MonsterKind::Griffin,
         MonsterKind::Hobgoblin,
         MonsterKind::IceMonster,
         MonsterKind::Jabberwock,
-        MonsterKind::Kobold,
+        MonsterKind::Kestrel,
         MonsterKind::Leprechaun,
         MonsterKind::Medusa,
-        MonsterKind::Naga,
+        MonsterKind::Nymph,
         MonsterKind::Orc,
         MonsterKind::Phantom,
         MonsterKind::Quagga,
-        MonsterKind::Rat,
+        MonsterKind::Rattlesnake,
         MonsterKind::Snake,
         MonsterKind::Troll,
-        MonsterKind::UrVile,
+        MonsterKind::BlackUnicorn,
         MonsterKind::Vampire,
         MonsterKind::Wraith,
         MonsterKind::Xeroc,
@@ -169,7 +159,7 @@ impl MonsterKind {
         MonsterKind::Zombie,
     ];
 
-    /// The kind whose letter is `c`, e.g. `from_letter('K') == Some(Kobold)`.
+    /// The kind whose letter is `c`, e.g. `from_letter('K') == Some(Kestrel)`.
     pub fn from_letter(c: char) -> Option<MonsterKind> {
         if c.is_ascii_uppercase() {
             MonsterKind::ALL.get((c as u8 - b'A') as usize).copied()
@@ -183,7 +173,7 @@ impl MonsterKind {
         (self as u8 + b'A') as char
     }
 
-    /// The classic lowercase name, e.g. "ur-vile".
+    /// The classic lowercase name, e.g. "black unicorn".
     pub fn name(self) -> &'static str {
         match self {
             MonsterKind::Aquator => "aquator",
@@ -191,22 +181,22 @@ impl MonsterKind {
             MonsterKind::Centaur => "centaur",
             MonsterKind::Dragon => "dragon",
             MonsterKind::Emu => "emu",
-            MonsterKind::Fungus => "fungus",
-            MonsterKind::Giant => "giant",
+            MonsterKind::Flytrap => "venus flytrap",
+            MonsterKind::Griffin => "griffin",
             MonsterKind::Hobgoblin => "hobgoblin",
             MonsterKind::IceMonster => "ice monster",
             MonsterKind::Jabberwock => "jabberwock",
-            MonsterKind::Kobold => "kobold",
+            MonsterKind::Kestrel => "kestrel",
             MonsterKind::Leprechaun => "leprechaun",
             MonsterKind::Medusa => "medusa",
-            MonsterKind::Naga => "naga",
+            MonsterKind::Nymph => "nymph",
             MonsterKind::Orc => "orc",
             MonsterKind::Phantom => "phantom",
             MonsterKind::Quagga => "quagga",
-            MonsterKind::Rat => "rat",
+            MonsterKind::Rattlesnake => "rattlesnake",
             MonsterKind::Snake => "snake",
             MonsterKind::Troll => "troll",
-            MonsterKind::UrVile => "ur-vile",
+            MonsterKind::BlackUnicorn => "black unicorn",
             MonsterKind::Vampire => "vampire",
             MonsterKind::Wraith => "wraith",
             MonsterKind::Xeroc => "xeroc",
@@ -215,164 +205,191 @@ impl MonsterKind {
         }
     }
 
-    /// The canonical stats from the classic 1980 Rogue monster table.
+    /// The canonical stats from the classic Rogue 5.4.4 monster table
+    /// (`extern.c:188`): exp, lvl, arm, dmg per report §6.1.
     pub fn stats(self) -> MonsterStats {
         match self {
             MonsterKind::Aquator => MonsterStats {
-                hit_points: 8,
-                armor_class: 4,
-                damage: Damage::new(1, 2),
-                exp: 4,
+                exp: 20,
+                level: 5,
+                armor_class: 2,
+                damage: "0x0/0x0",
+                is_mean: true,
             },
             MonsterKind::Bat => MonsterStats {
-                hit_points: 1,
-                armor_class: 1,
-                damage: Damage::new(1, 2),
                 exp: 1,
+                level: 1,
+                armor_class: 3,
+                damage: "1x2",
+                is_mean: false,
             },
             MonsterKind::Centaur => MonsterStats {
-                hit_points: 9,
-                armor_class: 6,
-                damage: Damage::new(1, 4),
-                exp: 2,
+                exp: 17,
+                level: 4,
+                armor_class: 4,
+                damage: "1x2/1x5/1x5",
+                is_mean: false,
             },
             MonsterKind::Dragon => MonsterStats {
-                hit_points: 16,
-                armor_class: 10,
-                damage: Damage::new(3, 4),
-                exp: 8,
+                exp: 5000,
+                level: 10,
+                armor_class: -1,
+                damage: "1x8/1x8/3x10",
+                is_mean: true,
             },
             MonsterKind::Emu => MonsterStats {
-                hit_points: 5,
-                armor_class: 4,
-                damage: Damage::new(1, 2),
-                exp: 1,
+                exp: 2,
+                level: 1,
+                armor_class: 7,
+                damage: "1x2",
+                is_mean: true,
             },
-            MonsterKind::Fungus => MonsterStats {
-                hit_points: 7,
+            MonsterKind::Flytrap => MonsterStats {
+                exp: 80,
+                level: 8,
+                armor_class: 3,
+                damage: "%%%x0",
+                is_mean: true,
+            },
+            MonsterKind::Griffin => MonsterStats {
+                exp: 2000,
+                level: 13,
                 armor_class: 2,
-                damage: Damage::none(),
-                exp: 1,
-            },
-            MonsterKind::Giant => MonsterStats {
-                hit_points: 12,
-                armor_class: 8,
-                damage: Damage::new(2, 4),
-                exp: 4,
+                damage: "4x3/3x5",
+                is_mean: true,
             },
             MonsterKind::Hobgoblin => MonsterStats {
-                hit_points: 3,
-                armor_class: 4,
-                damage: Damage::new(1, 8),
-                exp: 1,
+                exp: 3,
+                level: 1,
+                armor_class: 5,
+                damage: "1x8",
+                is_mean: true,
             },
             MonsterKind::IceMonster => MonsterStats {
-                hit_points: 6,
-                armor_class: 6,
-                damage: Damage::new(0, 1),
-                exp: 2,
+                exp: 5,
+                level: 1,
+                armor_class: 9,
+                damage: "0x0",
+                is_mean: false,
             },
             MonsterKind::Jabberwock => MonsterStats {
-                hit_points: 13,
-                armor_class: 10,
-                damage: Damage::new(2, 10),
-                exp: 7,
+                exp: 3000,
+                level: 15,
+                armor_class: 6,
+                damage: "2x12/2x4",
+                is_mean: false,
             },
-            MonsterKind::Kobold => MonsterStats {
-                hit_points: 4,
-                armor_class: 4,
-                damage: Damage::new(1, 4),
+            MonsterKind::Kestrel => MonsterStats {
                 exp: 1,
+                level: 1,
+                armor_class: 7,
+                damage: "1x4",
+                is_mean: true,
             },
             MonsterKind::Leprechaun => MonsterStats {
-                hit_points: 8,
+                exp: 10,
+                level: 3,
                 armor_class: 8,
-                damage: Damage::new(1, 4),
-                exp: 3,
+                damage: "1x1",
+                is_mean: false,
             },
             MonsterKind::Medusa => MonsterStats {
-                hit_points: 9,
-                armor_class: 9,
-                damage: Damage::new(2, 4),
-                exp: 3,
+                exp: 200,
+                level: 8,
+                armor_class: 2,
+                damage: "3x4/3x4/2x5",
+                is_mean: true,
             },
-            MonsterKind::Naga => MonsterStats {
-                hit_points: 9,
-                armor_class: 6,
-                damage: Damage::new(1, 4),
-                exp: 2,
+            MonsterKind::Nymph => MonsterStats {
+                exp: 37,
+                level: 3,
+                armor_class: 9,
+                damage: "0x0",
+                is_mean: false,
             },
             MonsterKind::Orc => MonsterStats {
-                hit_points: 5,
-                armor_class: 5,
-                damage: Damage::new(1, 8),
-                exp: 2,
+                exp: 5,
+                level: 1,
+                armor_class: 6,
+                damage: "1x8",
+                is_mean: false,
             },
             MonsterKind::Phantom => MonsterStats {
-                hit_points: 7,
-                armor_class: 6,
-                damage: Damage::new(1, 4),
-                exp: 2,
+                exp: 120,
+                level: 8,
+                armor_class: 3,
+                damage: "4x4",
+                is_mean: false,
             },
             MonsterKind::Quagga => MonsterStats {
-                hit_points: 6,
-                armor_class: 6,
-                damage: Damage::new(2, 4),
-                exp: 2,
+                exp: 15,
+                level: 3,
+                armor_class: 3,
+                damage: "1x5/1x5",
+                is_mean: true,
             },
-            MonsterKind::Rat => MonsterStats {
-                hit_points: 1,
-                armor_class: 4,
-                damage: Damage::new(1, 4),
-                exp: 1,
+            MonsterKind::Rattlesnake => MonsterStats {
+                exp: 9,
+                level: 2,
+                armor_class: 3,
+                damage: "1x6",
+                is_mean: true,
             },
             MonsterKind::Snake => MonsterStats {
-                hit_points: 4,
-                armor_class: 4,
-                damage: Damage::new(1, 4),
                 exp: 2,
+                level: 1,
+                armor_class: 5,
+                damage: "1x3",
+                is_mean: true,
             },
             MonsterKind::Troll => MonsterStats {
-                hit_points: 11,
-                armor_class: 8,
-                damage: Damage::new(2, 4),
-                exp: 3,
+                exp: 120,
+                level: 6,
+                armor_class: 4,
+                damage: "1x8/1x8/2x6",
+                is_mean: true,
             },
-            MonsterKind::UrVile => MonsterStats {
-                hit_points: 13,
-                armor_class: 8,
-                damage: Damage::new(2, 4),
-                exp: 6,
+            MonsterKind::BlackUnicorn => MonsterStats {
+                exp: 190,
+                level: 7,
+                armor_class: -2,
+                damage: "1x9/1x9/2x9",
+                is_mean: true,
             },
             MonsterKind::Vampire => MonsterStats {
-                hit_points: 12,
-                armor_class: 10,
-                damage: Damage::new(1, 8),
-                exp: 6,
+                exp: 350,
+                level: 8,
+                armor_class: 1,
+                damage: "1x10",
+                is_mean: true,
             },
             MonsterKind::Wraith => MonsterStats {
-                hit_points: 13,
-                armor_class: 10,
-                damage: Damage::new(2, 4),
-                exp: 6,
+                exp: 55,
+                level: 5,
+                armor_class: 4,
+                damage: "1x6",
+                is_mean: false,
             },
             MonsterKind::Xeroc => MonsterStats {
-                hit_points: 9,
+                exp: 100,
+                level: 7,
                 armor_class: 7,
-                damage: Damage::new(1, 4),
-                exp: 3,
+                damage: "4x4",
+                is_mean: false,
             },
             MonsterKind::Yeti => MonsterStats {
-                hit_points: 10,
-                armor_class: 8,
-                damage: Damage::new(2, 4),
-                exp: 3,
+                exp: 50,
+                level: 4,
+                armor_class: 6,
+                damage: "1x6/1x6",
+                is_mean: false,
             },
             MonsterKind::Zombie => MonsterStats {
-                hit_points: 6,
-                armor_class: 6,
-                damage: Damage::new(1, 8),
-                exp: 2,
+                exp: 6,
+                level: 2,
+                armor_class: 8,
+                damage: "1x8",
+                is_mean: true,
             },
         }
     }
@@ -383,27 +400,54 @@ impl MonsterKind {
     }
 }
 
-/// A monster on the current level: which kind, where, and how hurt it is.
+/// A monster on the current level: which kind, where, its rolled hit points
+/// and its spawn-scaled combat stats.
 ///
-/// Everything static about the kind (name, letter, armor class, damage,
-/// experience) comes from the canonical table via [`MonsterKind`]; the struct
-/// itself tracks identity, position and current hit points.
+/// Everything static about the kind (name, letter, damage string, meanness)
+/// comes from the canonical table via [`MonsterKind`]; the struct itself
+/// carries the per-spawn rolls: hit points `roll(level, 8)` (report §6.2 —
+/// the table's `hpt` column is an unused placeholder) and, on floors deeper
+/// than 26, the level/AC/exp depth scaling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Monster {
     pub kind: MonsterKind,
     pub x: usize,
     pub y: usize,
     pub hp: i32,
+    /// Rolled at spawn: `roll(level, 8)`, not a table stat.
+    pub max_hp: i32,
+    /// The monster's attacker level: table level + depth scaling.
+    pub level: u32,
+    /// Scaled armor class (table armor − depth scaling).
+    pub armor_class: i32,
+    /// Current experience value, granted on kill: base + depth scaling.
+    pub exp: i32,
+    /// ISRUN: waking and chasing. Sleeping monsters stay put until the player
+    /// sees them (ISMEAN, 2/3 chance) or attacks them (runto).
+    pub running: bool,
 }
 
 impl Monster {
-    /// Spawn `kind` at `(x, y)` at full hit points.
-    pub fn new(kind: MonsterKind, x: usize, y: usize) -> Monster {
+    /// Spawn `kind` at `(x, y)` on `floor` (`monsters.c:60 new_monster`):
+    /// HP = `roll(level, 8)`, plus one notch of depth scaling per floor below
+    /// the Amulet's level. All rolls come from `rng`, so the same seed
+    /// reproduces the same monster.
+    pub fn spawn(kind: MonsterKind, x: usize, y: usize, floor: u32, rng: &mut Rng) -> Monster {
+        let base = kind.stats();
+        let add = crate::combat::lev_add(floor);
+        let level = base.level + add;
+        let max_hp = crate::combat::roll(rng, level, 8);
+        let exp = base.exp + (add * 10) as i32 + crate::combat::exp_add(level, max_hp);
         Monster {
             kind,
             x,
             y,
-            hp: kind.stats().hit_points,
+            hp: max_hp,
+            max_hp,
+            level,
+            armor_class: base.armor_class - add as i32,
+            exp,
+            running: false,
         }
     }
 
@@ -415,16 +459,42 @@ impl Monster {
         self.kind.letter()
     }
 
+    /// The scaled armor class used by combat.
     pub fn armor_class(&self) -> i32 {
-        self.kind.stats().armor_class
+        self.armor_class
     }
 
-    pub fn damage(&self) -> Damage {
+    /// The monster's damage string (`s_dmg`), parsed by combat's roll_em.
+    pub fn damage_string(&self) -> &'static str {
         self.kind.stats().damage
     }
 
+    /// The experience granted for killing this monster (already depth-scaled).
     pub fn exp_value(&self) -> i32 {
-        self.kind.stats().exp
+        self.exp
+    }
+
+    /// ISMEAN: wakes on sight and chases the player (report §7.2).
+    pub fn is_mean(&self) -> bool {
+        self.kind.stats().is_mean
+    }
+}
+
+impl fmt::Display for Monster {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} ({},{}), hp {}/{} lvl {} ac {} dmg {} xp {}",
+            self.name(),
+            self.x,
+            self.y,
+            self.hp,
+            self.max_hp,
+            self.level,
+            self.armor_class,
+            self.damage_string(),
+            self.exp
+        )
     }
 }
 
@@ -451,18 +521,7 @@ impl Spawn {
             self.player.experience,
         );
         for m in &self.monsters {
-            out.push_str(&format!(
-                "\n{} {} at ({},{}), hp {}/{} ac {} dmg {} xp {}",
-                m.symbol(),
-                m.name(),
-                m.x,
-                m.y,
-                m.hp,
-                m.kind.stats().hit_points,
-                m.armor_class(),
-                m.damage(),
-                m.exp_value(),
-            ));
+            out.push_str(&format!("\n{m}"));
         }
         out
     }
@@ -474,10 +533,17 @@ impl Spawn {
 /// three-in-four chance of holding one monster (roughly mirroring Rogue's
 /// per-room scatter); monsters land on room floor tiles only — never on the
 /// player's tile and never on each other. All rolls come from `rng`, so the
-/// same seed yields the same level *and* the same spawn.
-pub fn populate(dungeon: &Dungeon, rng: &mut Rng) -> Spawn {
+/// same seed yields the same level *and* the same spawn (including rolled
+/// hit points). Hand-built maps without recorded rooms get the player in the
+/// top-left corner and no monsters.
+pub fn populate(dungeon: &Dungeon, floor: u32, rng: &mut Rng) -> Spawn {
     let rooms = dungeon.rooms();
-    let room = *rooms.first().expect("a generated dungeon always has rooms");
+    let Some(room) = rooms.first() else {
+        return Spawn {
+            player: Player::new(1, 1),
+            monsters: Vec::new(),
+        };
+    };
     let player = Player::new(room.center().0, room.center().1);
 
     let mut blocked: HashSet<(usize, usize)> = HashSet::from([(player.x, player.y)]);
@@ -496,15 +562,15 @@ pub fn populate(dungeon: &Dungeon, rng: &mut Rng) -> Spawn {
         }
         let (x, y) = free[rng.below(free.len())];
         blocked.insert((x, y));
-        monsters.push(Monster::new(MonsterKind::random(rng), x, y));
+        monsters.push(Monster::spawn(MonsterKind::random(rng), x, y, floor, rng));
     }
     Spawn { player, monsters }
 }
 
 /// `populate` with a fresh RNG from `seed`, so a seed reproduces the whole
 /// level including its inhabitants.
-pub fn populate_seeded(dungeon: &Dungeon, seed: u64) -> Spawn {
-    populate(dungeon, &mut Rng::new(seed))
+pub fn populate_seeded(dungeon: &Dungeon, floor: u32, seed: u64) -> Spawn {
+    populate(dungeon, floor, &mut Rng::new(seed))
 }
 
 #[cfg(test)]
@@ -525,6 +591,7 @@ mod tests {
         assert_eq!(player.gold, PLAYER_START_GOLD);
         assert_eq!(player.experience, PLAYER_START_EXPERIENCE);
         assert_eq!(player.level, PLAYER_START_LEVEL);
+        assert!(player.running);
         assert_eq!(player.symbol(), '@');
     }
 
@@ -548,58 +615,75 @@ mod tests {
     fn monster_stats_are_sane() {
         for kind in MonsterKind::ALL {
             let s = kind.stats();
-            assert!(s.hit_points >= 1, "{kind:?} has no hit points");
             assert!(s.exp >= 1, "{kind:?} gives no experience");
+            assert!((1..=15).contains(&s.level), "{kind:?} level {}", s.level);
             assert!(
-                (0..=12).contains(&s.armor_class),
+                (-2..=9).contains(&s.armor_class),
                 "{kind:?} armor class {} out of range",
                 s.armor_class
             );
             assert!(
-                s.damage.dice <= 4 && s.damage.sides <= 10,
-                "{kind:?} damage {s:?} out of range"
+                s.damage.contains('x'),
+                "{kind:?} damage string {s:?} has no dice separator"
             );
         }
-        // The iconic values everyone quotes from the classic table.
+        // The iconic values from the canonical 5.4.4 table (report §6.1).
         assert_eq!(
             MonsterKind::Zombie.stats(),
             MonsterStats {
-                hit_points: 6,
-                armor_class: 6,
-                damage: Damage::new(1, 8),
-                exp: 2,
+                exp: 6,
+                level: 2,
+                armor_class: 8,
+                damage: "1x8",
+                is_mean: true,
             }
         );
-        assert_eq!(MonsterKind::Bat.stats().hit_points, 1);
-        assert_eq!(MonsterKind::Rat.stats().hit_points, 1);
-        assert_eq!(MonsterKind::Dragon.stats().damage, Damage::new(3, 4));
-        assert_eq!(MonsterKind::Fungus.stats().damage, Damage::none());
-        // Dragon is the meanest; bat and rat are the feeblest.
-        let toughest = MonsterKind::ALL
-            .iter()
-            .max_by_key(|k| k.stats().hit_points)
-            .copied()
-            .unwrap();
-        assert_eq!(toughest, MonsterKind::Dragon);
+        assert_eq!(MonsterKind::Bat.stats().level, 1);
+        assert_eq!(MonsterKind::Orc.stats().exp, 5);
+        assert_eq!(MonsterKind::Orc.stats().armor_class, 6);
+        assert_eq!(MonsterKind::Dragon.stats().armor_class, -1);
+        assert_eq!(MonsterKind::Dragon.stats().damage, "1x8/1x8/3x10");
+        assert_eq!(MonsterKind::Centaur.stats().damage, "1x2/1x5/1x5");
+        assert_eq!(MonsterKind::Flytrap.stats().damage, "%%%x0");
+        assert!(!MonsterKind::Orc.stats().is_mean, "orc is greedy, not mean");
+        assert!(MonsterKind::Kestrel.stats().is_mean);
+        // The dragon is the biggest bounty; the jabberwock the highest level;
+        // the black unicorn the hardest to hit.
         let most_xp = MonsterKind::ALL
             .iter()
             .max_by_key(|k| k.stats().exp)
             .copied()
             .unwrap();
         assert_eq!(most_xp, MonsterKind::Dragon);
-        assert_eq!(MonsterKind::Bat.stats().exp, 1);
+        let highest = MonsterKind::ALL
+            .iter()
+            .max_by_key(|k| k.stats().level)
+            .copied()
+            .unwrap();
+        assert_eq!(highest, MonsterKind::Jabberwock);
+        let lowest_arm = MonsterKind::ALL
+            .iter()
+            .min_by_key(|k| k.stats().armor_class)
+            .copied()
+            .unwrap();
+        assert_eq!(lowest_arm, MonsterKind::BlackUnicorn);
     }
 
     #[test]
-    fn monster_construction_uses_kind_stats() {
-        let monster = Monster::new(MonsterKind::Kobold, 2, 3);
+    fn monster_construction_spawns_with_rolled_hp() {
+        let mut rng = Rng::new(13);
+        let monster = Monster::spawn(MonsterKind::Kestrel, 2, 3, 1, &mut rng);
         assert_eq!((monster.x, monster.y), (2, 3));
-        assert_eq!(monster.hp, 4);
-        assert_eq!(monster.name(), "kobold");
+        assert_eq!(monster.max_hp, monster.hp);
+        assert!((1..=8).contains(&monster.hp), "hp = roll(1,8)");
+        assert_eq!(monster.name(), "kestrel");
         assert_eq!(monster.symbol(), 'K');
-        assert_eq!(monster.armor_class(), 4);
-        assert_eq!(monster.damage(), Damage::new(1, 4));
-        assert_eq!(monster.exp_value(), 1);
+        assert_eq!(monster.armor_class(), 7);
+        assert_eq!(monster.damage_string(), "1x4");
+        assert_eq!(monster.level, 1);
+        assert!(monster.exp_value() >= 1);
+        assert!(!monster.running, "freshly spawned monsters are asleep");
+        assert!(monster.is_mean(), "kestrel is ISMEAN");
     }
 
     /// In-bounds, on room floor tiles, never the player's tile, never each
@@ -608,7 +692,7 @@ mod tests {
     fn spawn_is_valid_across_seeds() {
         for seed in SEEDS {
             let dungeon = Dungeon::generate(seed);
-            let spawn = populate_seeded(&dungeon, seed);
+            let spawn = populate_seeded(&dungeon, 1, seed);
 
             let rooms = dungeon.rooms();
             let player_room = rooms[0];
@@ -644,6 +728,7 @@ mod tests {
                     seen.insert((monster.x, monster.y)),
                     "seed {seed}: duplicate position {monster:?}"
                 );
+                assert_eq!(monster.max_hp, monster.hp, "spawned monsters start full");
             }
         }
     }
@@ -652,8 +737,8 @@ mod tests {
     fn spawn_is_deterministic_per_seed() {
         for seed in [1, 7, 42, 1234] {
             let dungeon = Dungeon::generate(seed);
-            let first = populate_seeded(&dungeon, seed);
-            let second = populate_seeded(&dungeon, seed);
+            let first = populate_seeded(&dungeon, 1, seed);
+            let second = populate_seeded(&dungeon, 1, seed);
             assert_eq!(first, second, "seed {seed} must reproduce its spawn");
         }
     }
@@ -661,8 +746,21 @@ mod tests {
     #[test]
     fn different_seeds_place_differently() {
         let summaries: HashSet<String> = (0..20)
-            .map(|seed| populate_seeded(&Dungeon::generate(seed), seed).summary())
+            .map(|seed| populate_seeded(&Dungeon::generate(seed), 1, seed).summary())
             .collect();
         assert!(summaries.len() > 1, "expected different seeds to differ");
+    }
+
+    #[test]
+    fn populate_without_rooms_does_not_panic() {
+        let dungeon = Dungeon::from_tiles(
+            4,
+            3,
+            &[Tile::Floor; 12],
+        );
+        let spawn = populate_seeded(&dungeon, 1, 1);
+        assert_eq!(spawn.player.x, 1);
+        assert_eq!(spawn.player.y, 1);
+        assert!(spawn.monsters.is_empty());
     }
 }
