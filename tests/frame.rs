@@ -87,12 +87,14 @@ fn frame_fills_the_window_at_every_size() {
         let hint = row(&buffer, (h + 1) as u16);
         assert!(hint.contains("seed"), "{cols}x{rows} hint: {hint:?}");
 
-        // The frame carries the level's features: exactly one player, both
-        // staircases.
+        // The frame carries the level's features: exactly one player — in
+        // the starting room — and unexplored tiles render as solid rock.
         let text = frame_text(&buffer);
         assert_eq!(text.matches('@').count(), 1, "{cols}x{rows}");
-        assert!(text.contains('>'), "{cols}x{rows}: the down stair is drawn");
-        assert!(text.contains('<'), "{cols}x{rows}: the up stair is drawn");
+        assert!(
+            text.chars().any(|c| c == '.'),
+            "{cols}x{rows}: the starting room floor is lit"
+        );
     }
 }
 
@@ -193,7 +195,10 @@ fn resize_regenerates_the_frame_at_the_new_size() {
     assert!(game.player.hp > 0, "resize must not reset the player");
     let text = frame_text(&new);
     assert_eq!(text.matches('@').count(), 1);
-    assert!(text.contains('>') && text.contains('<'), "both staircases regenerate");
+    assert!(
+        text.chars().any(|c| c == '.'),
+        "the starting room floor is lit after the resize"
+    );
 }
 
 /// Resizing keeps the player's position when it still lands on walkable
@@ -288,4 +293,119 @@ fn buffer_text_is_one_line_per_row_at_the_buffer_width() {
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 24);
     assert!(lines.iter().all(|l| l.chars().count() == 80));
+}
+
+// ---------------------------------------------------------------------------
+// Field of view
+// ---------------------------------------------------------------------------
+
+/// Two rooms joined by a corridor through doors: room A interior
+/// (1..6, 1..5), room B interior (16..21, 1..5), doors at (7, 5) and
+/// (15, 5), corridor row 5 from (8, 5) to (14, 5).
+fn two_rooms() -> rogue::map::Dungeon {
+    let rows = [
+        "#######################",
+        "#......#########......#",
+        "#......#########......#",
+        "#......#########......#",
+        "#......#########......#",
+        "#......+~~~~~~~+......#",
+        "#######################",
+    ];
+    let width = rows[0].len();
+    let tiles: Vec<rogue::map::Tile> = rows
+        .iter()
+        .flat_map(|row| row.chars())
+        .map(|c| match c {
+            '#' => rogue::map::Tile::Wall,
+            '.' => rogue::map::Tile::Floor,
+            '+' => rogue::map::Tile::Door,
+            '~' => rogue::map::Tile::Corridor,
+            other => panic!("unknown tile {other:?}"),
+        })
+        .collect();
+    rogue::map::Dungeon::from_tiles(width, rows.len(), &tiles)
+}
+
+/// A fresh game's frame shows only the starting room: every lit tile is
+/// drawn exactly as `glyph_at` renders it, and every tile outside the view
+/// is solid rock (the classic unexplored look).
+#[test]
+fn fresh_game_shows_only_the_starting_room_and_rock_elsewhere() {
+    let game = Game::new(7, 80, 22);
+    let buffer = render(&game, 80, 24);
+    // On a fresh floor seen == visible: the starting room, nothing more.
+    assert_eq!(
+        game.visible.iter().filter(|&&v| v).count(),
+        game.seen.iter().filter(|&&s| s).count(),
+        "fresh floor: seen equals visible"
+    );
+    for y in 0..game.map.height {
+        for x in 0..game.map.width {
+            let idx = y * game.map.width + x;
+            let glyph = buffer[(x as u16, y as u16)].symbol();
+            if game.visible[idx] {
+                assert_eq!(glyph, game.glyph_at(x, y).to_string(), "lit ({x},{y})");
+            } else {
+                assert_eq!(glyph, "#", "unexplored ({x},{y}) must render as rock");
+            }
+        }
+    }
+    let (px, py) = (game.player.x, game.player.y);
+    assert_eq!(buffer[(px as u16, py as u16)].symbol(), "@", "the player is lit");
+    assert!(game.visible[py * game.map.width + px], "the player's tile is visible");
+}
+
+/// Walking into a new room reveals it (its monsters render), and leaving it
+/// dims it again: the tile stays remembered as bare floor, the monster is
+/// no longer drawn.
+#[test]
+fn moving_to_a_new_room_reveals_it_and_leaving_dims_it() {
+    let mut game = Game::from_map(two_rooms(), 1);
+    // A snake in room B, far from the starting room.
+    let base = rogue::entity::MonsterKind::Snake.stats();
+    let letter = rogue::entity::MonsterKind::Snake.letter();
+    game.monsters = vec![rogue::entity::Monster {
+        kind: rogue::entity::MonsterKind::Snake,
+        x: 18,
+        y: 3,
+        hp: 100,
+        max_hp: 100,
+        level: base.level,
+        armor_class: base.armor_class,
+        exp: base.exp,
+        running: false,
+    }];
+    // Roomless fixture maps spawn the player at (1, 1), in room A.
+    assert_eq!((game.player.x, game.player.y), (1, 1));
+    assert_eq!(game.glyph_at(18, 3), '#', "room B starts unexplored rock");
+
+    // Walk east to the door, south down room A, then east through the
+    // corridor and the far door into room B.
+    for _ in 0..5 {
+        game.move_player(rogue::game::Direction::East);
+    }
+    for _ in 0..4 {
+        game.move_player(rogue::game::Direction::South);
+    }
+    for _ in 0..10 {
+        game.move_player(rogue::game::Direction::East);
+    }
+    assert_eq!((game.player.x, game.player.y), (16, 5), "inside room B");
+
+    // Room B is revealed: the monster is drawn, room A is remembered.
+    let buffer = render(&game, 80, 24);
+    assert_eq!(buffer[(18, 3)].symbol(), letter.to_string(), "the monster renders in a lit room");
+    assert_eq!(buffer[(3, 3)].symbol(), ".", "room A stays remembered after leaving");
+    assert!(!game.visible[3 * game.map.width + 3], "room A is not lit from room B");
+
+    // Step back out into the corridor: room B dims, the monster disappears.
+    for _ in 0..2 {
+        game.move_player(rogue::game::Direction::West);
+    }
+    assert_eq!((game.player.x, game.player.y), (14, 5), "out in the corridor");
+    let buffer = render(&game, 80, 24);
+    assert_eq!(buffer[(18, 3)].symbol(), ".", "the tile is remembered, the monster is not");
+    assert_eq!(buffer[(3, 3)].symbol(), ".", "room A stays remembered");
+    assert_eq!(buffer[(11, 2)].symbol(), "#", "unexplored rock stays rock");
 }
