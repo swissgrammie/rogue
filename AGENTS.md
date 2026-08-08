@@ -8,12 +8,17 @@ find the Amulet of Yendor and get out.
 - Keep modules small: map generation, entities, combat, FOV, UI, game loop.
   Game logic lives in the library (`src/lib.rs` + one module per concern);
   `src/main.rs` is a thin CLI shell over it, so modules stay unit-testable.
-  The play loop is `src/game.rs`: raw crossterm (raw mode + alternate screen)
-  until ratatui lands; input mapping and collision rules are pure functions
-  with unit tests there. The loop redraws only when the state changed
-  (`Game::step` returns whether it did; blocked moves and unknown keys draw
-  nothing) and overwrites the fixed-size frame instead of clearing the whole
-  screen.
+  The play loop is `src/game.rs`: ratatui (`Terminal<CrosstermBackend>`)
+  owns raw mode, the alternate screen, and resize handling; crossterm still
+  supplies input events. `src/ui.rs` is the single draw path — the map as a
+  fixed grid of buffer cells, the status/hint lines as Paragraphs — shared
+  by the interactive loop, `--dump-frame`, and the TestBackend tests, so
+  the plain-text frame is character-identical to the terminal frame.
+  Input mapping and collision rules are pure functions with unit tests
+  there. The loop redraws only when the state changed (`Game::step` returns
+  whether it did; blocked moves and unknown keys draw nothing); ratatui's
+  buffer diffing writes only the changed cells, so an idle terminal stays
+  perfectly still instead of flickering.
 - Combat is `src/combat.rs`: swing/roll_em/killed/check_level and the fight
   round (player acts, then runners → doctor → hunger). The monster table in
   `src/entity.rs` is the Rogue 5.4.4 Aquator…Zombie set (exp/lvl/arm/dmg
@@ -38,7 +43,9 @@ find the Amulet of Yendor and get out.
   3x3 room grid's native minimum (`map::GRID_MIN_*`) get a single-room
   fallback in `Dungeon::generate_sized` instead of panicking. Explicit
   `--width`/`--height` override auto-fit; `--dump-map` keeps its 80x24
-  defaults.
+  defaults. `ui::draw` also clamps to the frame area, so a terminal that
+  shrinks between a resize event and the next draw renders what fits
+  instead of overflowing the buffer.
 - Terminal-free testability: `game::play(seed, width, height, &[Key])` runs
   a scripted session with no terminal (deterministic for a seed; stops on
   quit/death/escape), `game::script_keys` parses a key string (`h/j/k/l`,
@@ -47,15 +54,21 @@ find the Amulet of Yendor and get out.
   exposes these as `rogue --script <keys> --seed N [--width/--height]`
   (snapshot to stdout, exit 0) and `rogue --dump-frame [--floor N]
   [--width/--height]` (the exact interactive frame — map + status + hint —
-  via the shared `Game::render`/`status_line`, default 80x24). The golden
-  harness lives in `tests/harness.rs`: no-overflow line counts at tiny
-  windows, deterministic-run snapshots, frame content at two sizes, and a
-  reactive walker (stealth paths around unwinnable monsters, hunting
-  winnable ones, sprinting the last steps) that records a key script and
-  replays it through the CLI. NOTE: a full 26-floor `won: true` journey is
-  currently unreachable — the monster table spawns at full table stats on
-  every floor and chasers are unshakeable, so every seed hits an unwinnable
-  guard (probe bottoms out around floor 8); see the walker test docs.
+  rendered through the same ratatui buffer path as the terminal via
+  `Game::render`, default 80x24). The display itself is deterministically
+  testable at any window size with `ratatui::TestBackend` — `tests/frame.rs`
+  sweeps window sizes (80x24 … 50x30), pins the no-overflow invariant at
+  tiny windows (map rows + the two UI lines always fit, status always
+  visible), and covers resizes (regeneration at the new size, no stale
+  content). The golden harness lives in `tests/harness.rs`: no-overflow line
+  counts at tiny windows, deterministic-run snapshots, frame content at two
+  sizes, and a reactive walker (stealth paths around unwinnable monsters,
+  hunting winnable ones, sprinting the last steps) that records a key
+  script and replays it through the CLI. NOTE: a full 26-floor `won: true`
+  journey is currently unreachable — the monster table spawns at full table
+  stats on every floor and chasers are unshakeable, so every seed hits an
+  unwinnable guard (probe bottoms out around floor 8); see the walker test
+  docs.
 - This working copy is a Jujutsu (jj) workspace, not a plain git checkout.
   If $JJHOUSE_AGENT_GUIDE is set, read that file before touching version
   control. Never run raw git write commands; describe work with `jj describe`.
