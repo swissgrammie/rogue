@@ -28,6 +28,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
+use std::collections::HashMap;
 use std::io::{self, Stdout};
 
 use crate::combat;
@@ -132,6 +133,18 @@ pub struct Game {
     pub has_amulet: bool,
     /// True once the player escapes: floor 1's exit stair with the Amulet.
     pub won: bool,
+    /// Tiles the player has ever seen on the current floor, row-major over
+    /// the map. Exploration memory: never-seen tiles render as solid rock,
+    /// and re-entering a floor restores its seen grid.
+    pub seen: Vec<bool>,
+    /// Tiles lit right now — the room the player stands in, or the short
+    /// line-of-sight reach down a corridor ([`crate::visibility`]).
+    /// Monsters and items render only on visible tiles.
+    pub visible: Vec<bool>,
+    /// The `seen` grids of the other floors, keyed by floor number, so a
+    /// floor the player leaves and re-enters restores its exploration
+    /// memory. Cleared when a resize regenerates the map at a new size.
+    seen_maps: HashMap<u32, Vec<bool>>,
 }
 
 impl Game {
@@ -167,7 +180,8 @@ impl Game {
         let stairs = levels::place_stairs(&map, &mut rng, (spawn.player.x, spawn.player.y));
         let amulet = (floor == AMULET_LEVEL)
             .then(|| levels::place_amulet(&map, &mut rng, stairs, (spawn.player.x, spawn.player.y)));
-        Game {
+        let (map_w, map_h) = (map.width, map.height);
+        let mut game = Game {
             map,
             player: Player::new(spawn.player.x, spawn.player.y),
             seed,
@@ -180,7 +194,12 @@ impl Game {
             rng,
             quiet: 0,
             last_message: None,
-        }
+            seen: vec![false; map_w * map_h],
+            visible: Vec::new(),
+            seen_maps: HashMap::new(),
+        };
+        game.refresh_visibility();
+        game
     }
 
     /// One round (report §7.1): the player acts, then the AFTER daemons run
@@ -260,18 +279,20 @@ impl Game {
         if self.player.hp <= 0 {
             self.last_message = Some("you have died".to_string());
         }
+        self.refresh_visibility();
         true
     }
 
     /// Move the player one tile in `dir`; returns whether the position
     /// changed (a blocked move changes nothing). Pure movement: no fight, no
-    /// stairs, no monster phase.
+    /// stairs, no monster phase. Refreshes the view from the new position.
     pub fn move_player(&mut self, dir: Direction) -> bool {
         if can_move(&self.map, self.player.x, self.player.y, dir) {
             let (nx, ny) = next_position(self.player.x, self.player.y, dir)
                 .expect("can_move validated the step");
             self.player.x = nx;
             self.player.y = ny;
+            self.refresh_visibility();
             true
         } else {
             false
@@ -316,25 +337,50 @@ impl Game {
     }
 
     /// Descend one floor: regenerate the next floor deterministically and
-    /// arrive on its up staircase.
+    /// arrive on its up staircase. Exploration memory is per floor: the
+    /// current floor's seen grid is saved and the next floor's is restored
+    /// if it was visited before.
     fn descend(&mut self) {
         let carried = self.has_amulet;
         let next = Self::at_floor(self.seed, self.floor + 1, self.map.width, self.map.height);
         let (x, y) = next.stairs.up;
+        self.seen_maps.insert(self.floor, std::mem::take(&mut self.seen));
+        let mut seen_maps = std::mem::take(&mut self.seen_maps);
+        let next_seen = seen_maps.remove(&next.floor).unwrap_or_default();
         *self = next;
+        self.seen_maps = seen_maps;
+        let size = self.map.width * self.map.height;
+        self.seen = if next_seen.len() == size {
+            next_seen
+        } else {
+            vec![false; size]
+        };
         self.has_amulet = carried;
         self.player = Player::new(x, y);
+        self.refresh_visibility();
     }
 
     /// Ascend one floor: regenerate the previous floor deterministically and
-    /// arrive on its down staircase. The Amulet travels with the player.
+    /// arrive on its down staircase. The Amulet travels with the player; the
+    /// floor's exploration memory is saved and restored like a descent's.
     fn ascend(&mut self) {
         let carried = self.has_amulet;
         let next = Self::at_floor(self.seed, self.floor - 1, self.map.width, self.map.height);
         let (x, y) = next.stairs.down;
+        self.seen_maps.insert(self.floor, std::mem::take(&mut self.seen));
+        let mut seen_maps = std::mem::take(&mut self.seen_maps);
+        let next_seen = seen_maps.remove(&next.floor).unwrap_or_default();
         *self = next;
+        self.seen_maps = seen_maps;
+        let size = self.map.width * self.map.height;
+        self.seen = if next_seen.len() == size {
+            next_seen
+        } else {
+            vec![false; size]
+        };
         self.has_amulet = carried;
         self.player = Player::new(x, y);
+        self.refresh_visibility();
     }
 
     /// Regenerate the current floor at a new map size (a terminal resize),
@@ -360,11 +406,43 @@ impl Game {
         }
         next.has_amulet = carried;
         *self = next;
+        // The map regenerated at a new size: exploration memory is void.
+        self.seen = vec![false; self.map.width * self.map.height];
+        self.seen_maps.clear();
+        self.refresh_visibility();
     }
 
-    /// The glyph at `(x, y)` as every renderer draws it: the player, else a
-    /// monster, else the Amulet, else a staircase, else the tile.
+    /// Recompute what the player can currently see from their position
+    /// ([`crate::visibility`]) and fold it into the floor's exploration
+    /// memory: every lit tile becomes seen. Called after every move, floor
+    /// change, and resize, so `visible` is always current for rendering.
+    pub fn refresh_visibility(&mut self) {
+        self.visible = crate::visibility::compute(&self.map, self.player.x, self.player.y);
+        debug_assert_eq!(self.visible.len(), self.seen.len());
+        for (i, lit) in self.visible.iter().enumerate() {
+            if *lit {
+                self.seen[i] = true;
+            }
+        }
+    }
+
+    /// The glyph at `(x, y)` as every renderer draws it, through the field
+    /// of view: the player is always drawn; a tile currently visible shows
+    /// its full overlay (monsters, Amulet, staircases, tile); a tile
+    /// explored but not currently visible shows the bare remembered tile
+    /// (no features); a tile never explored renders as solid rock.
     pub fn glyph_at(&self, x: usize, y: usize) -> char {
+        let pos = (x, y);
+        if pos == (self.player.x, self.player.y) {
+            return '@';
+        }
+        let idx = y * self.map.width + x;
+        if !self.seen[idx] {
+            return map::Tile::Wall.glyph(); // never explored: solid rock
+        }
+        if !self.visible[idx] {
+            return self.map.tile(x, y).glyph(); // explored but dark: the bare tile
+        }
         overlay_glyph(
             &self.player,
             &self.monsters,
@@ -1213,6 +1291,153 @@ mod tests {
             game.map.render(),
             Dungeon::generate_sized(map_seed, 60, 20).render(),
             "the resized floor regenerates deterministically"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Field of view
+    // -------------------------------------------------------------------
+
+    /// Two rooms joined by a corridor through doors (the same fixture as
+    /// `visibility::tests`): room A interior (1..6, 1..5), room B interior
+    /// (16..21, 1..5), doors at (7, 5) and (15, 5), corridor row 5 from
+    /// (8, 5) to (14, 5).
+    const TWO_ROOMS: [&str; 7] = [
+        "#######################",
+        "#......#########......#",
+        "#......#########......#",
+        "#......#########......#",
+        "#......#########......#",
+        "#......+~~~~~~~+......#",
+        "#######################",
+    ];
+
+    /// Move the player along a path of directions (no combat, no stairs).
+    fn walk(game: &mut Game, dirs: &[Direction]) {
+        for &dir in dirs {
+            assert!(game.move_player(dir), "the step {:?} must be walkable", dir);
+        }
+    }
+
+    /// A fresh game renders only the starting room: the room's floor and
+    /// door are lit, and everything else is solid rock.
+    #[test]
+    fn fresh_game_sees_only_the_starting_room() {
+        let game = Game::from_map(map_from(&TWO_ROOMS), 1);
+        // Roomless fixture maps spawn the player at (1, 1).
+        assert_eq!((game.player.x, game.player.y), (1, 1));
+        assert_eq!(game.glyph_at(1, 1), '@');
+        assert_eq!(game.glyph_at(3, 3), '.', "room A floor is lit");
+        assert_eq!(game.glyph_at(7, 5), '+', "the door is lit from inside the room");
+        assert_eq!(game.glyph_at(11, 5), '#', "the corridor is unexplored rock");
+        assert_eq!(game.glyph_at(18, 3), '#', "room B is unexplored rock");
+        assert_eq!(game.glyph_at(20, 5), '#', "room B's far edge is rock too");
+    }
+
+    /// Leaving a room keeps its tiles seen (they render as the bare tile,
+    /// not rock), while never-seen tiles stay rock.
+    #[test]
+    fn leaving_a_room_keeps_it_seen_but_unlit() {
+        let mut game = Game::from_map(map_from(&TWO_ROOMS), 1);
+        // Walk out of room A into the corridor.
+        walk(
+            &mut game,
+            &[
+                Direction::East,
+                Direction::East,
+                Direction::East,
+                Direction::East,
+                Direction::East,
+                Direction::South,
+                Direction::South,
+                Direction::South,
+                Direction::South,
+                Direction::East,
+                Direction::East,
+            ],
+        );
+        assert_eq!((game.player.x, game.player.y), (8, 5), "in the corridor");
+
+        // Room A is remembered: seen but not visible, rendered bare.
+        let idx = 3 * game.map.width + 3;
+        assert!(game.seen[idx], "room A was explored");
+        assert!(!game.visible[idx], "room A is dark from the corridor");
+        assert_eq!(game.glyph_at(3, 3), '.', "the remembered tile renders bare");
+        // Room B was never seen and renders as rock.
+        assert_eq!(game.glyph_at(18, 3), '#', "never-seen room B is rock");
+        // The door is within the corridor's short reach and stays visible.
+        assert_eq!(game.glyph_at(7, 5), '+', "the door down the corridor is lit");
+    }
+
+    /// Monsters render only on currently visible tiles: a monster in a
+    /// distant room is not drawn while the player is elsewhere, is drawn
+    /// when the player walks into its room, and disappears again once its
+    /// tile goes dark (the tile stays remembered).
+    #[test]
+    fn monsters_render_only_when_on_a_visible_tile() {
+        let mut game = Game::from_map(map_from(&TWO_ROOMS), 1);
+        let snake = monster(MonsterKind::Snake, 18, 3);
+        let letter = snake.symbol();
+        game.monsters = vec![snake];
+
+        // In room A the monster in room B is not drawn (its tile is rock).
+        assert_eq!(game.glyph_at(18, 3), '#');
+
+        // Walk into room B: the monster is on a visible tile and renders.
+        walk(
+            &mut game,
+            &[
+                Direction::East,
+                Direction::East,
+                Direction::East,
+                Direction::East,
+                Direction::East,
+                Direction::South,
+                Direction::South,
+                Direction::South,
+                Direction::South,
+                Direction::East,
+                Direction::East,
+                Direction::East,
+                Direction::East,
+                Direction::East,
+                Direction::East,
+                Direction::East,
+                Direction::East,
+                Direction::East,
+                Direction::East,
+            ],
+        );
+        assert_eq!((game.player.x, game.player.y), (16, 5), "inside room B");
+        assert_eq!(game.glyph_at(18, 3), letter, "the monster renders in a lit room");
+
+        // Step back out into the corridor: the tile is remembered but dark,
+        // so the monster is no longer drawn.
+        walk(&mut game, &[Direction::West, Direction::West]);
+        assert_eq!((game.player.x, game.player.y), (14, 5), "out in the corridor");
+        assert_eq!(game.glyph_at(18, 3), '.', "the tile is remembered, the monster is not");
+    }
+
+    /// Exploration memory persists across floor changes: leaving a floor
+    /// saves its seen grid, and re-entering it restores it.
+    #[test]
+    fn explored_tiles_stay_seen_across_floor_changes() {
+        let mut game = Game::new(7, crate::map::MAP_WIDTH, crate::map::MAP_HEIGHT);
+        let floor1_seen = game.seen.clone();
+        assert!(floor1_seen.iter().any(|&s| s), "the starting room is seen on floor 1");
+
+        game.step_onto(game.stairs.down);
+        assert_eq!(game.floor, 2);
+        let floor2_seen = game.seen.clone();
+        assert!(floor2_seen.iter().any(|&s| s), "the arrival room is seen on floor 2");
+
+        game.step_onto(game.stairs.up);
+        assert_eq!(game.floor, 1);
+        // Re-entering floor 1 restores its exploration memory (plus any
+        // tiles newly lit from the arrival position).
+        assert!(
+            game.seen.iter().zip(&floor1_seen).all(|(a, b)| !*b || *a),
+            "every previously seen floor-1 tile is still seen"
         );
     }
 }

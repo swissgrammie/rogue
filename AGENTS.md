@@ -19,6 +19,18 @@ find the Amulet of Yendor and get out.
   whether it did; blocked moves and unknown keys draw nothing); ratatui's
   buffer diffing writes only the changed cells, so an idle terminal stays
   perfectly still instead of flickering.
+- Field of view lives in `src/visibility.rs` and `Game`'s per-floor state:
+  `Game.seen` (tiles ever explored, persisted per floor via `seen_maps` so
+  re-entering a floor restores it) and `Game.visible` (recomputed on every
+  move/floor change/resize by `Game::refresh_visibility`). Rules: standing in
+  a room lights the whole room (floor + wall ring + doors); a corridor gives
+  a short `SIGHT_RANGE` line-of-sight reach with walls and closed doors
+  blocking. `Game::glyph_at` is the FOV-aware draw path: visible tiles show
+  full features, seen-but-dark tiles show the bare tile, never-seen tiles
+  are solid rock. `--dump-map` keeps the full map (via `render_level`);
+  `--dump-frame` shows the player's actual view. Frame tests pin the FOV in
+  `tests/frame.rs` (fresh game = starting room + rock elsewhere; moving to a
+  new room reveals it; leaving dims it).
 - Combat is `src/combat.rs`: swing/roll_em/killed/check_level and the fight
   round (player acts, then runners → doctor → hunger). The monster table in
   `src/entity.rs` is the Rogue 5.4.4 Aquator…Zombie set (exp/lvl/arm/dmg

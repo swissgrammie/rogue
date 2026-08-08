@@ -202,11 +202,23 @@ fn dump_frame_shows_the_report_9_status_and_hint() {
         assert_eq!(status, expected, "{cols}x{rows}");
         let hint = lines[rows as usize - 1].trim_end();
         assert!(hint.contains("h/j/k/l"), "{cols}x{rows}: {hint:?}");
-        // The map lines carry the level's features.
+        // The map lines carry the player's view: the starting room, with
+        // every tile outside it solid rock. On a fresh floor seen ==
+        // visible, so any non-rock glyph must be on a visible tile.
         let map_rows = &lines[..rows as usize - 2];
         assert!(map_rows.iter().any(|l| l.contains('@')), "{cols}x{rows}: the player is drawn");
-        assert!(map_rows.iter().any(|l| l.contains('>')), "{cols}x{rows}: the down stair is drawn");
-        assert!(map_rows.iter().any(|l| l.contains('<')), "{cols}x{rows}: the up stair is drawn");
+        let (w, h) = map::fit_bounds(cols as usize, rows as usize);
+        let game = rogue::game::Game::at_floor(7, 1, w, h);
+        for (y, line) in map_rows.iter().enumerate() {
+            for (x, c) in line.chars().enumerate() {
+                if c != '#' {
+                    assert!(
+                        game.visible[y * w + x],
+                        "{cols}x{rows}: ({x},{y}) drawn but not visible"
+                    );
+                }
+            }
+        }
     }
 }
 

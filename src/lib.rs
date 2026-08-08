@@ -10,3 +10,4 @@ pub mod levels;
 pub mod map;
 pub mod rng;
 pub mod ui;
+pub mod visibility;
