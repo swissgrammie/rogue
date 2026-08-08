@@ -2,29 +2,33 @@
 //!
 //! One terminal frame per keypress: redraw the level with the player marker
 //! (`@`) after every move. Input mapping and collision checks live in pure
-//! functions so the rules stay unit-testable without a terminal. The UI is
-//! deliberately raw crossterm for now; ratatui lands later without changing
-//! the game rules here.
+//! functions so the rules stay unit-testable without a terminal; rendering
+//! itself is ratatui's job (`crate::ui`), so the frame, resize handling, and
+//! the terminal state (raw mode, alternate screen) are robust by
+//! construction while the game rules here stay untouched.
 //!
 //! Each round follows Rogue's phase order (report §7.1): the player acts
 //! first (move, or fight the monster in the way), then the AFTER daemons run
 //! in order — `runners` (monsters wake/chase/attack) → `doctor` (healing) →
 //! `stomach` (hunger). All combat math lives in `crate::combat`; this module
-//! owns input mapping, rendering, the status line, and round state (the
-//! `quiet` healing counter).
+//! owns input mapping, the status line, and round state (the `quiet` healing
+//! counter). Rendering lives in `crate::ui`; the loop here just drives it.
 //!
 //! Level progression (stairs, the floor counter, the Amulet, the win) is
 //! coordinated here too: `Game` is the integration point the combat module
 //! reads the floor number from and extends the status line at.
 
-use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::cursor::{Hide, Show};
 use crossterm::event::{read, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, size, Clear, ClearType, EnterAlternateScreen,
-    LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, size, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use std::io::{self, Write};
+use ratatui::backend::CrosstermBackend;
+use ratatui::text::Line;
+use ratatui::widgets::Paragraph;
+use ratatui::Terminal;
+use std::io::{self, Stdout};
 
 use crate::combat;
 use crate::entity::{self, Monster, Player};
@@ -337,7 +341,7 @@ impl Game {
     /// keeping the player's stats, position (when it still lands on walkable
     /// floor), and carried Amulet. The level, monsters, and stairs re-roll
     /// deterministically for the new size from the same floor seed.
-    fn resize(&mut self, width: usize, height: usize) {
+    pub fn resize(&mut self, width: usize, height: usize) {
         let carried = self.has_amulet;
         let (x, y) = (self.player.x, self.player.y);
         let mut player = self.player.clone();
@@ -358,16 +362,18 @@ impl Game {
         *self = next;
     }
 
-    /// The glyph at `(x, y)`: the player, else a monster, else the tile.
+    /// The glyph at `(x, y)` as every renderer draws it: the player, else a
+    /// monster, else the Amulet, else a staircase, else the tile.
     pub fn glyph_at(&self, x: usize, y: usize) -> char {
-        if x == self.player.x && y == self.player.y {
-            return '@';
-        }
-        self.monsters
-            .iter()
-            .find(|m| m.x == x && m.y == y)
-            .map(|m| m.symbol())
-            .unwrap_or_else(|| self.map.tile(x, y).glyph())
+        overlay_glyph(
+            &self.player,
+            &self.monsters,
+            self.amulet,
+            self.stairs,
+            &self.map,
+            x,
+            y,
+        )
     }
 
     /// The status line, formatted per report §9
@@ -398,33 +404,13 @@ impl Game {
         line
     }
 
-    /// The level with every feature overlaid (monsters, staircases, the
-    /// Amulet, and `@`), then the status line and a one-line hint or message.
-    /// The two UI lines are truncated to the map width so a narrow terminal
-    /// never wraps them.
+    /// The frame exactly as the interactive terminal draws it, as plain
+    /// text: the map, then the status line and a hint or message line.
+    /// Rendered through the shared ratatui buffer path (`crate::ui`), so
+    /// `--dump-frame` and the golden tests see output character-identical
+    /// to the terminal.
     pub fn render(&self) -> String {
-        let mut out =
-            render_level(&self.map, self.player.clone(), self.stairs, self.amulet, &self.monsters);
-        out.push_str(&Self::fit_line(&self.status_line(), self.map.width));
-        out.push('\n');
-        match &self.last_message {
-            Some(message) => out.push_str(&Self::fit_line(message, self.map.width)),
-            None => out.push_str(&Self::fit_line(
-                &format!("seed {} - h/j/k/l or arrows move, q quits", self.seed),
-                self.map.width,
-            )),
-        }
-        out.push('\n');
-        out
-    }
-
-    /// Fit one UI line to exactly `width` characters: truncate long lines so
-    /// a narrow terminal never wraps them, and pad short lines so an
-    /// overwrite never leaves stale text from an earlier, longer line.
-    fn fit_line(line: &str, width: usize) -> String {
-        let mut out: String = line.chars().take(width).collect();
-        out.extend(std::iter::repeat(' ').take(width - out.chars().count()));
-        out
+        crate::ui::render_text(self, self.map.width, self.map.height + crate::ui::UI_LINES)
     }
 
     /// One compact line summarizing the final state, for `--script` and the
@@ -454,18 +440,6 @@ impl Game {
         self.floor == 1 && (self.player.x, self.player.y) == self.stairs.up
     }
 
-    /// Overwrite the whole frame. The frame is a fixed size — map rows plus
-    /// the status and hint lines, every line exactly the map's width — so a
-    /// draw at an unchanged size replaces every cell with no clear and no
-    /// flicker. A resize clears the old frame's stale rows first (see
-    /// `run`), and the alternate screen starts blank, so the display never
-    /// accumulates leftover text.
-    fn draw(&self, out: &mut impl Write) -> io::Result<()> {
-        execute!(out, MoveTo(0, 0))?;
-        write!(out, "{}", self.render())?;
-        out.flush()
-    }
-
     #[cfg(test)]
     /// The test twin of a successful move in the play loop: put the player
     /// on `pos` and run one `after_move`.
@@ -475,8 +449,37 @@ impl Game {
     }
 }
 
+/// The glyph one cell shows, with every feature overlaid in display order:
+/// the player, then a monster, then the Amulet, then the staircases, then
+/// the bare tile. The single overlay used by `Game::glyph_at`, `render_level`
+/// and the ratatui frame, so every renderer agrees on one cell's glyph.
+fn overlay_glyph(
+    player: &Player,
+    monsters: &[Monster],
+    amulet: Option<Amulet>,
+    stairs: Stairs,
+    map: &Dungeon,
+    x: usize,
+    y: usize,
+) -> char {
+    let pos = (x, y);
+    if pos == (player.x, player.y) {
+        '@'
+    } else if let Some(monster) = monsters.iter().find(|m| (m.x, m.y) == pos) {
+        monster.symbol()
+    } else if amulet.is_some_and(|a| (a.x, a.y) == pos) {
+        AMULET_GLYPH
+    } else if pos == stairs.down {
+        STAIRS_DOWN_GLYPH
+    } else if pos == stairs.up {
+        STAIRS_UP_GLYPH
+    } else {
+        map.tile(x, y).glyph()
+    }
+}
+
 /// A level's map with its features overlaid: monsters, staircases, the Amulet
-/// (`,`) and the player (`@`). Shared by the play loop and `--dump-map`.
+/// (`,`) and the player (`@`). Shared by `--dump-map` and the render tests.
 pub fn render_level(
     map: &Dungeon,
     player: Player,
@@ -487,21 +490,7 @@ pub fn render_level(
     let mut out = String::with_capacity((map.width + 1) * map.height);
     for y in 0..map.height {
         for x in 0..map.width {
-            let pos = (x, y);
-            let glyph = if pos == (player.x, player.y) {
-                '@'
-            } else if let Some(monster) = monsters.iter().find(|m| (m.x, m.y) == pos) {
-                monster.symbol()
-            } else if amulet.is_some_and(|a| (a.x, a.y) == pos) {
-                AMULET_GLYPH
-            } else if pos == stairs.down {
-                STAIRS_DOWN_GLYPH
-            } else if pos == stairs.up {
-                STAIRS_UP_GLYPH
-            } else {
-                map.tile(x, y).glyph()
-            };
-            out.push(glyph);
+            out.push(overlay_glyph(&player, monsters, amulet, stairs, map, x, y));
         }
         out.push('\n');
     }
@@ -638,42 +627,48 @@ fn any_key() -> io::Result<Key> {
 }
 
 /// The victory screen: the player escaped with the Amulet.
-fn escape_screen(out: &mut impl Write, game: &Game) -> io::Result<()> {
-    execute!(out, MoveTo(0, 0), Clear(ClearType::All))?;
-    writeln!(out, "You escaped with the Amulet!")?;
-    writeln!(out)?;
-    writeln!(out, "Climbing the last stair, you step out of the Dungeons of Doom")?;
-    writeln!(out, "into the light of day, the Amulet of Yendor warm in your pack.")?;
-    writeln!(out)?;
-    writeln!(out, "Final floor: {}   seed: {}", game.floor, game.seed)?;
-    writeln!(out)?;
-    writeln!(out, "Press any key to return to your terminal.")?;
-    out.flush()?;
+fn escape_screen(terminal: &mut Terminal<CrosstermBackend<Stdout>>, game: &Game) -> io::Result<()> {
+    terminal.draw(|frame| {
+        let text = vec![
+            Line::from("You escaped with the Amulet!"),
+            Line::from(""),
+            Line::from("Climbing the last stair, you step out of the Dungeons of Doom"),
+            Line::from("into the light of day, the Amulet of Yendor warm in your pack."),
+            Line::from(""),
+            Line::from(format!("Final floor: {}   seed: {}", game.floor, game.seed)),
+            Line::from(""),
+            Line::from("Press any key to return to your terminal."),
+        ];
+        frame.render_widget(Paragraph::new(text), frame.area());
+    })?;
     any_key()?;
     Ok(())
 }
 
 /// Play the game: size the map to the terminal (or the explicit
 /// `--width`/`--height` overrides), draw the current floor, then loop on
-/// keys until the player quits, dies, or escapes with the Amulet. Terminal
-/// resizes regenerate the floor at the new size and redraw immediately.
+/// keys until the player quits, dies, or escapes with the Amulet. The frame
+/// is drawn through ratatui, which owns raw mode, the alternate screen, and
+/// resize handling; terminal resizes regenerate the floor at the new size
+/// and redraw immediately.
 pub fn run(seed: u64, width: Option<usize>, height: Option<usize>) -> io::Result<()> {
     // Fall back to the classic extent when there is no terminal to query.
     let (cols, rows) = size().unwrap_or((map::MAP_WIDTH as u16, map::MAP_HEIGHT as u16));
     let (w, h) = map::resolve_map_size(width, height, cols as usize, rows as usize);
     let mut game = Game::new(seed, w, h);
     let _guard = TerminalGuard::enter()?;
-    let mut out = io::stdout();
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     loop {
-        game.draw(&mut out)?;
+        terminal.draw(|frame| crate::ui::draw(frame, &game))?;
         if game.player.hp <= 0 {
             return Ok(()); // the frame above shows "you have died"
         }
         // The frame on screen is current; wait for an event that actually
         // changes the game. Unknown keys and blocked moves change nothing
         // and are ignored without a redraw, so an idle terminal stays
-        // perfectly still instead of flickering.
+        // perfectly still instead of flickering (ratatui's diffing writes
+        // only the cells that changed anyway).
         loop {
             match read_event()? {
                 LoopEvent::Resize(cols, rows) => {
@@ -681,9 +676,10 @@ pub fn run(seed: u64, width: Option<usize>, height: Option<usize>) -> io::Result
                         map::resolve_map_size(width, height, cols as usize, rows as usize);
                     if (w, h) != (game.map.width, game.map.height) {
                         game.resize(w, h);
-                        // A new size: drop the old frame's stale rows, then
-                        // redraw the regenerated floor below.
-                        execute!(out, Clear(ClearType::All))?;
+                        // A new size: ratatui's next draw picks up the new
+                        // viewport and the regenerated floor replaces the
+                        // old frame wholesale — no stale rows to clear by
+                        // hand, and the terminal can never be left torn.
                         break;
                     }
                     // Same size: nothing changed, keep waiting.
@@ -693,7 +689,7 @@ pub fn run(seed: u64, width: Option<usize>, height: Option<usize>) -> io::Result
                     let Some(dir) = key_to_direction(key) else { continue };
                     let changed = game.step(dir);
                     if game.won {
-                        return escape_screen(&mut out, &game);
+                        return escape_screen(&mut terminal, &game);
                     }
                     if changed {
                         break; // redraw the new state below

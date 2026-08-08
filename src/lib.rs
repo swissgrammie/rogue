@@ -9,3 +9,4 @@ pub mod game;
 pub mod levels;
 pub mod map;
 pub mod rng;
+pub mod ui;
